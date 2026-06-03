@@ -167,6 +167,11 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
     // Lazily allocated native handle to a JniParquetMetaReader. Created on
     // the first canSkipRowGroup call and freed by clear().
     private long nativeReaderPtr;
+    // Committed _pm size of the MVCC snapshot whose footer resolveFooter
+    // settled on. Equals fileSize when the latest footer is selected, and a
+    // smaller value when the chain walk picks an older footer. Reset by
+    // clear(). Lets seqTxn-by-version reads target the selected footer.
+    private long resolvedFileSize;
     private int rowGroupCount;
 
     /**
@@ -315,6 +320,7 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
         this.addr = 0;
         this.fileSize = 0;
         this.footerAddr = 0;
+        this.resolvedFileSize = 0;
         this.columnCount = 0;
         this.rowGroupCount = 0;
         this.checksumVerified = false;
@@ -591,6 +597,7 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
         this.addr = other.addr;
         this.fileSize = other.fileSize;
         this.footerAddr = other.footerAddr;
+        this.resolvedFileSize = other.resolvedFileSize;
         this.columnCount = other.columnCount;
         this.rowGroupCount = other.rowGroupCount;
         this.checksumVerified = other.checksumVerified;
@@ -609,6 +616,58 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
     public void readPartitionMeta(long destAddr) {
         assert addr != 0;
         readPartitionMeta0(addr, fileSize, destAddr);
+    }
+
+    /**
+     * Reads the {@code seqTxn} stamped into the footer of the {@code _pm}
+     * snapshot identified by {@code parquetFileSize}, opening and mapping the
+     * file for the duration of the call. {@code parquetFileSize} is the parquet
+     * file size from {@code _txn} field 3, used as the MVCC version token: the
+     * footer the chain walk settles on is the one whose derived parquet file
+     * size matches, which need not be the latest snapshot.
+     * <p>
+     * Returns {@code -1} when the file is missing or unreadable, when no footer
+     * in the chain matches {@code parquetFileSize}, or when the matched footer
+     * carries no {@code seqTxn}. Treat any non-negative result as the version's
+     * {@code seqTxn} and {@code -1} as "absent" — the same convention the
+     * footer's unset sentinel uses.
+     *
+     * @param ff              files facade
+     * @param path            path to the {@code _pm} file
+     * @param parquetFileSize parquet file size from {@code _txn}, the MVCC
+     *                        version token selecting the footer to read
+     * @return the matched footer's {@code seqTxn}, or {@code -1} if absent
+     * @throws CairoException on malformed {@code _pm} data
+     */
+    public long readSeqTxnForVersion(FilesFacade ff, LPSZ path, long parquetFileSize) {
+        long mappedAddr = 0;
+        long mappedSize = 0;
+        try {
+            mappedAddr = openAndMapRO(ff, path, this);
+            if (mappedAddr == 0) {
+                return -1;
+            }
+            // Capture the mapping size before clear() zeros it; needed for munmap.
+            mappedSize = fileSize;
+            if (!resolveFooter(parquetFileSize)) {
+                return -1;
+            }
+            // readPartitionMeta0 re-derives the footer from the size passed in,
+            // so feed it the resolved snapshot's committed size to read the
+            // selected version's seqTxn rather than the latest footer's.
+            final long buf = Unsafe.malloc(24, MemoryTag.NATIVE_DEFAULT);
+            try {
+                readPartitionMeta0(mappedAddr, resolvedFileSize, buf);
+                return Unsafe.getLong(buf + 16);
+            } finally {
+                Unsafe.free(buf, 24, MemoryTag.NATIVE_DEFAULT);
+            }
+        } finally {
+            clear();
+            if (mappedAddr != 0) {
+                ff.munmap(mappedAddr, mappedSize, MemoryTag.MMAP_PARQUET_METADATA_READER);
+            }
+        }
     }
 
     /**
@@ -853,6 +912,7 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
 
         // All validations passed — commit state.
         this.footerAddr = footerAddr;
+        this.resolvedFileSize = currentSize;
         this.columnCount = columnCount;
         this.rowGroupCount = rowGroupCount;
         return true;
