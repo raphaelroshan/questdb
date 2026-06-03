@@ -28,8 +28,8 @@ import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.Reopenable;
 import io.questdb.griffin.engine.table.parquet.ParquetDecoder;
-import io.questdb.griffin.engine.table.parquet.ParquetPartitionDecoder;
 import io.questdb.griffin.engine.table.parquet.ParquetFileDecoder;
+import io.questdb.griffin.engine.table.parquet.ParquetPartitionDecoder;
 import io.questdb.griffin.engine.table.parquet.RowGroupBuffers;
 import io.questdb.std.DirectIntList;
 import io.questdb.std.DirectLongList;
@@ -566,8 +566,15 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
             clearAddresses();
             if (parquetColumns.size() > 0) {
                 decoder.decodeRowGroup(rowGroupBuffers, parquetColumns, rowGroup, rowLo, rowHi);
-                remapColumns();
             }
+            // Always size and zero the page-address lists, even when there are no
+            // parquet columns to decode (every projected column was added after this
+            // partition became parquet). remapColumns() is the only place that does
+            // so; skipping it leaves stale/uninitialized native memory in the lists,
+            // and a record reading an absent column then dereferences a wild address.
+            // With no decoded columns the remap loop is a no-op, so every column
+            // correctly resolves to address 0 (NULL).
+            remapColumns();
         }
 
         public void decodeRemainingColumns(
@@ -619,10 +626,28 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
         // address pair into their respective query slots.
         private void remapColumns() {
             final int columnCount = addressCache.getColumnCount();
+            if (columnCount == 0) {
+                // The query reads no columns (e.g. count(*)). clearAddresses() already
+                // left the lists empty, which is the correct state; there is nothing to
+                // remap. Sizing them to 0 would trip DirectLongList.setCapacity()'s
+                // assert capacity > 0.
+                return;
+            }
             ensureCapacityAndZero(pageAddresses, columnCount);
             ensureCapacityAndZero(pageSizes, columnCount);
             ensureCapacityAndZero(auxPageAddresses, columnCount);
             ensureCapacityAndZero(auxPageSizes, columnCount);
+
+            if (parquetColumns.size() == 0) {
+                // No parquet column was decoded (every projected column was added
+                // after this partition became parquet). openParquet() only adds a
+                // column to parquetColumns when columnIdToParquetIdx maps it to a
+                // present parquet column, so an empty parquetColumns means every
+                // column below would resolve to parquetIdx < 0 and continue. The
+                // zeroing above already left them all at address 0 (NULL), so skip
+                // the dead remap loop.
+                return;
+            }
 
             final ColumnMapping columnMapping = addressCache.getColumnMapping();
             final int readParquetColumnCount = columnMapping.getColumnCount();

@@ -40,6 +40,7 @@
 //! (see [`BloomFilterSource`]).
 
 use parquet2::metadata::FileMetaData;
+use parquet2::metadata::SortingColumn;
 use parquet2::schema::types::{PhysicalType, PrimitiveLogicalType};
 use parquet2::thrift_format::{ColumnMetaData, RowGroup};
 use qdb_core::col_type::ColumnTypeTag;
@@ -172,51 +173,85 @@ pub struct SortingCol {
     pub descending: bool,
 }
 
-/// Extracts the sorting columns shared by all row groups. Returns an empty
-/// vector when the footer carries no sorting columns. Returns an error if the
-/// sorting columns differ between row groups, since `_pm` stores a single
-/// per-file list.
+/// The dense position and order of qdb_meta's designated timestamp, or `None`
+/// when there is no designated timestamp.
+fn designated_sorting_col(qdb_meta: &QdbMeta) -> Option<SortingCol> {
+    qdb_meta
+        .schema
+        .iter()
+        .position(|col| col.column_type.is_designated())
+        .map(|pos| SortingCol {
+            column_idx: pos as i32,
+            descending: !qdb_meta.schema[pos]
+                .column_type
+                .is_designated_timestamp_ascending(),
+        })
+}
+
+pub fn resolve_sorting_columns(
+    file_metadata: &FileMetaData,
+    qdb_meta: Option<&QdbMeta>,
+) -> ParquetMetaResult<Vec<SortingCol>> {
+    match qdb_meta.and_then(designated_sorting_col) {
+        Some(sc) => Ok(vec![sc]),
+        None => extract_sorting_columns(file_metadata),
+    }
+}
+
+/// Sort columns declared in the parquet footer. Row groups that declare none are
+/// skipped -- a legacy O3 merge left copied groups unstamped while fresh ones
+/// carried the timestamp sort column -- so only the declaring groups must agree;
+/// genuinely conflicting orders are rejected.
 pub fn extract_sorting_columns(file_metadata: &FileMetaData) -> ParquetMetaResult<Vec<SortingCol>> {
-    let mut result: Option<Vec<SortingCol>> = None;
+    let mut reference: Option<(usize, &[SortingColumn])> = None;
 
     for (rg_idx, rg) in file_metadata.row_groups.iter().enumerate() {
-        let current = match rg.sorting_columns() {
-            Some(cols) => cols
-                .iter()
+        let current: &[SortingColumn] = match rg.sorting_columns() {
+            Some(cols) if !cols.is_empty() => cols.as_slice(),
+            _ => continue, // no sorting columns -> ignore this row group
+        };
+
+        let (ref_idx, prev) = match reference {
+            Some(r) => r,
+            None => {
+                reference = Some((rg_idx, current));
+                continue;
+            }
+        };
+
+        if prev.len() != current.len() {
+            return Err(parquet_meta_err!(
+                ParquetMetaErrorKind::SchemaMismatch,
+                "sorting columns differ between row groups: rg {} has {} but rg {} has {}",
+                ref_idx,
+                prev.len(),
+                rg_idx,
+                current.len()
+            ));
+        }
+        for (i, (p, c)) in prev.iter().zip(current.iter()).enumerate() {
+            if p.column_idx != c.column_idx || p.descending != c.descending {
+                return Err(parquet_meta_err!(
+                    ParquetMetaErrorKind::SchemaMismatch,
+                    "sorting column {} differs between row groups {} and {}",
+                    i,
+                    ref_idx,
+                    rg_idx
+                ));
+            }
+        }
+    }
+
+    Ok(reference
+        .map(|(_, cols)| {
+            cols.iter()
                 .map(|sc| SortingCol {
                     column_idx: sc.column_idx,
                     descending: sc.descending,
                 })
-                .collect::<Vec<_>>(),
-            None => Vec::new(),
-        };
-
-        if let Some(ref prev) = result {
-            if prev.len() != current.len() {
-                return Err(parquet_meta_err!(
-                    ParquetMetaErrorKind::SchemaMismatch,
-                    "sorting columns differ between row groups: rg 0 has {} but rg {} has {}",
-                    prev.len(),
-                    rg_idx,
-                    current.len()
-                ));
-            }
-            for (i, (p, c)) in prev.iter().zip(current.iter()).enumerate() {
-                if p.column_idx != c.column_idx || p.descending != c.descending {
-                    return Err(parquet_meta_err!(
-                        ParquetMetaErrorKind::SchemaMismatch,
-                        "sorting column {} differs between row groups 0 and {}",
-                        i,
-                        rg_idx
-                    ));
-                }
-            }
-        } else {
-            result = Some(current);
-        }
-    }
-
-    Ok(result.unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// Detects the designated timestamp column from QdbMeta (preferred) or by
@@ -296,6 +331,12 @@ pub fn validate_file_paths(file_metadata: &FileMetaData) -> ParquetMetaResult<()
 ///   bytes are available.
 /// - `ts_stats_backfill`: optional decode callback the converter calls when a
 ///   row group's designated timestamp column lacks inline min/max stats.
+///
+/// # Errors
+/// - If any column chunk references an external `file_path` (not supported).
+/// - If the footer's row groups declare conflicting sorting columns and
+///   `qdb_meta` has no designated timestamp to fall back on.
+/// - If `qdb_meta` is present but its schema length doesn't match the parquet column count.
 #[allow(clippy::too_many_arguments)]
 pub fn convert_from_parquet(
     file_metadata: &FileMetaData,
@@ -320,7 +361,7 @@ pub fn convert_from_parquet(
     }
 
     validate_file_paths(file_metadata)?;
-    let sorting_cols = extract_sorting_columns(file_metadata)?;
+    let sorting_cols = resolve_sorting_columns(file_metadata, qdb_meta)?;
     let designated_ts = detect_designated_timestamp(file_metadata, qdb_meta, &sorting_cols);
 
     let mut writer = ParquetMetaWriter::new();

@@ -22,9 +22,9 @@ pub mod writer;
 pub use column_chunk::ColumnChunkRaw;
 pub use convert::{
     build_row_group_block, convert_from_parquet, detect_designated_timestamp,
-    extract_sorting_columns, generate_parquet_metadata, physical_type_to_u8, validate_file_paths,
-    BloomFilterSource, NoBloomFilterSource, ParquetMetaColumnInfo, SliceBloomFilterSource,
-    SortingCol, TsStatsBackfill,
+    extract_sorting_columns, generate_parquet_metadata, physical_type_to_u8,
+    resolve_sorting_columns, validate_file_paths, BloomFilterSource, NoBloomFilterSource,
+    ParquetMetaColumnInfo, SliceBloomFilterSource, SortingCol, TsStatsBackfill,
 };
 pub use error::{ParquetMetaError, ParquetMetaErrorKind, ParquetMetaResult};
 pub use footer::{Footer, FooterBuilder};

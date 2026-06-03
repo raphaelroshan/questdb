@@ -131,8 +131,9 @@ fn generate_parquet_meta(
     })?;
     let bloom_source = SliceBloomFilterSource::new(&file_data);
 
-    let sorting_cols = qdb_parquet_meta::convert::extract_sorting_columns(&metadata)
-        .map_err(ParquetError::from)?;
+    let sorting_cols =
+        qdb_parquet_meta::convert::resolve_sorting_columns(&metadata, qdb_meta.as_ref())
+            .map_err(ParquetError::from)?;
     let designated_ts = qdb_parquet_meta::convert::detect_designated_timestamp(
         &metadata,
         qdb_meta.as_ref(),

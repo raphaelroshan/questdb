@@ -488,6 +488,314 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Regression: an O3 merge copies unchanged row groups without re-stamping
+    /// the partition's designated-timestamp sort column, so a converted-then-
+    /// merged partition ends up with rg 0 declaring no sorting columns and rg 1
+    /// declaring the timestamp sort column. This is the exact shape Mig941 reads
+    /// from the on-disk footer; extract_sorting_columns used to reject it with
+    /// "rg 0 has 0 but rg 1 has 1" and crash replica bootstrap. It must now
+    /// tolerate the mix while still rejecting genuinely conflicting sort orders.
+    #[test]
+    fn extract_sorting_columns_tolerates_groups_without_sorting() {
+        use parquet2::metadata::{RowGroupMetaData, SortingColumn};
+
+        // Parse a real file to get a valid FileMetaData shell, then overwrite
+        // its row groups to mimic an O3-merged partition.
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let mut metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+
+        let ts_sort = vec![SortingColumn::new(0, false, false)];
+        metadata.row_groups = vec![
+            // copied: no sort cols
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+            // fresh: ts sort
+            RowGroupMetaData::with_sorting_columns(vec![], 10, Some(ts_sort.clone()), 0),
+        ];
+
+        // Used to error with "rg 0 has 0 but rg 1 has 1"; now tolerated, adopting
+        // the sort columns of the only row group that declares any.
+        let cols = extract_sorting_columns(&metadata)
+            .expect("a mix of empty and non-empty sorting columns must be tolerated");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].column_idx, 0);
+        assert!(!cols[0].descending);
+
+        // Reverse order: rg0 declares the sort column, rg1 declares none -> still tolerated.
+        metadata.row_groups = vec![
+            // fresh: ts sort
+            RowGroupMetaData::with_sorting_columns(vec![], 10, Some(ts_sort.clone()), 0),
+            // copied: no sort cols
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+        ];
+        let cols = extract_sorting_columns(&metadata)
+            .expect("a mix of empty and non-empty sorting columns must be tolerated");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].column_idx, 0);
+        assert!(!cols[0].descending);
+
+        // Two row groups sorted on DIFFERENT columns is a real conflict -> still rejected.
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                0,
+            ),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(1, false, false)]),
+                0,
+            ),
+        ];
+        assert!(extract_sorting_columns(&metadata).is_err());
+
+        // Two row groups that declare a DIFFERENT number of sorting columns is
+        // also a real conflict -> still rejected.
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                0,
+            ),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![
+                    SortingColumn::new(0, false, false),
+                    SortingColumn::new(1, false, false),
+                ]),
+                0,
+            ),
+        ];
+        assert!(extract_sorting_columns(&metadata).is_err());
+
+        // Same column but OPPOSITE sort direction is a real conflict -> still rejected.
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                0,
+            ),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, true, false)]),
+                0,
+            ),
+        ];
+        assert!(extract_sorting_columns(&metadata).is_err());
+    }
+
+    /// Regression: extract_sorting_columns must stay correct with MORE than two
+    /// row groups, where non-declaring (no-sort-column) groups are interleaved
+    /// among declaring ones. A partition that is converted and then O3-merged
+    /// repeatedly accumulates several copied groups (no sorting columns) around
+    /// freshly written ones (the timestamp sort column). The two-row-group tests
+    /// never adopt the reference from a non-first group and then hit a conflict
+    /// on a later, non-adjacent group; this one does.
+    #[test]
+    fn extract_sorting_columns_handles_many_row_groups() {
+        use parquet2::metadata::{RowGroupMetaData, SortingColumn};
+
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let mut metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+
+        let ts_sort = || Some(vec![SortingColumn::new(0, false, false)]);
+
+        // Four groups; sorting columns declared only on the inner two, with empty
+        // groups before, between, and after -> tolerated, adopting [ts].
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+            RowGroupMetaData::with_sorting_columns(vec![], 10, ts_sort(), 0),
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+            RowGroupMetaData::with_sorting_columns(vec![], 10, ts_sort(), 0),
+        ];
+        let cols = extract_sorting_columns(&metadata)
+            .expect("interleaved empty and matching groups must be tolerated");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].column_idx, 0);
+        assert!(!cols[0].descending);
+
+        // Reference adopted from a non-first group (rg1), conflict on a later,
+        // non-adjacent group (rg3) -> rejected. rg0 and rg2 are skipped.
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                0,
+            ),
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(1, false, false)]),
+                0,
+            ),
+        ];
+        assert!(
+            extract_sorting_columns(&metadata).is_err(),
+            "a conflicting sort column on a later group must still be rejected"
+        );
+
+        // Conflict expressed as a differing sort-column COUNT on a later group.
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(vec![], 10, None, 0),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                0,
+            ),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![
+                    SortingColumn::new(0, false, false),
+                    SortingColumn::new(1, false, false),
+                ]),
+                0,
+            ),
+        ];
+        assert!(
+            extract_sorting_columns(&metadata).is_err(),
+            "a differing sort-column count on a later group must still be rejected"
+        );
+    }
+
+    /// End-to-end: the full Mig941 conversion (resolve_sorting_columns ->
+    /// detect_designated_timestamp -> _pm writer -> ParquetMetaReader), not just
+    /// extract_sorting_columns in isolation, must tolerate an O3-merged footer
+    /// that mixes a copied row group (no sort cols) with a fresh one (the ts
+    /// sort col) and still record the designated timestamp. This is the exact
+    /// path that threw "rg 0 has 0 but rg 1 has 1" and crashed replica bootstrap.
+    #[test]
+    fn convert_from_parquet_tolerates_mixed_sorting_columns() {
+        use parquet2::metadata::{RowGroupMetaData, SortingColumn};
+
+        // A real, valid file (real column chunks + QdbMeta), ts sort column at col 0.
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let mut metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+        let qdb_meta = extract_qdb_meta_from(&metadata).expect("test parquet has qdb meta");
+
+        // Reshape into the O3-merged footer shape, carrying the REAL column chunks
+        // so convert_from_parquet's per-row-group column walk runs for real: rg0
+        // copied (no sort cols), rg1 fresh (ts sort col).
+        let cols = metadata.row_groups[0].columns().to_vec();
+        let n = metadata.row_groups[0].num_rows();
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(cols.clone(), n, None, 0),
+            RowGroupMetaData::with_sorting_columns(
+                cols,
+                n,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                1,
+            ),
+        ];
+
+        // The full conversion must succeed and still record the designated ts.
+        let (pm_bytes, pm_size) =
+            convert_from_parquet(&metadata, Some(&qdb_meta), 0, 0, &NoBloomFilterSource, None)
+                .expect("convert_from_parquet must tolerate the mixed O3 footer");
+        let reader = ParquetMetaReader::from_file_size(&pm_bytes, pm_size).unwrap();
+        assert_eq!(reader.designated_timestamp(), Some(0));
+        assert_eq!(reader.sorting_column_count(), 1);
+        assert_eq!(reader.sorting_column(0).unwrap(), 0);
+    }
+
+    /// C1 regression: across a version upgrade an update-mode O3 merge can leave a
+    /// footer whose declaring row groups disagree -- a cached group with the stale
+    /// index 1, a freshly appended group with the corrected index 0. The footer
+    /// reader rejects that, but the migration must trust qdb_meta and not abort.
+    #[test]
+    fn convert_from_parquet_tolerates_conflicting_sort_indices_via_qdb_meta() {
+        use parquet2::metadata::{RowGroupMetaData, SortingColumn};
+
+        // Real, valid file with qdb_meta designating the timestamp at column 0.
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let mut metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+        let qdb_meta = extract_qdb_meta_from(&metadata).expect("test parquet has qdb meta");
+
+        // Footer shape: copied group (no sort col), legacy stale [1], corrected [0].
+        let cols = metadata.row_groups[0].columns().to_vec();
+        let n = metadata.row_groups[0].num_rows();
+        metadata.row_groups = vec![
+            RowGroupMetaData::with_sorting_columns(cols.clone(), n, None, 0),
+            RowGroupMetaData::with_sorting_columns(
+                cols.clone(),
+                n,
+                Some(vec![SortingColumn::new(1, false, false)]),
+                1,
+            ),
+            RowGroupMetaData::with_sorting_columns(
+                cols,
+                n,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                2,
+            ),
+        ];
+
+        // The footer reader alone rejects this; the migration must not.
+        assert!(extract_sorting_columns(&metadata).is_err());
+
+        let (pm_bytes, pm_size) =
+            convert_from_parquet(&metadata, Some(&qdb_meta), 0, 0, &NoBloomFilterSource, None)
+                .expect("convert_from_parquet must resolve sorting from qdb_meta, not the footer");
+        let reader = ParquetMetaReader::from_file_size(&pm_bytes, pm_size).unwrap();
+        assert_eq!(reader.designated_timestamp(), Some(0));
+        assert_eq!(reader.sorting_column_count(), 1);
+        // The dense designated position (0), not the stale footer index 1.
+        assert_eq!(reader.sorting_column(0).unwrap(), 0);
+
+        // Scoped to QuestDB files: without qdb_meta the conflict still aborts.
+        assert!(convert_from_parquet(&metadata, None, 0, 0, &NoBloomFilterSource, None).is_err());
+    }
+
+    /// extract_sorting_columns returns an empty set for a footer with no row groups.
+    #[test]
+    fn extract_sorting_columns_handles_zero_row_groups() {
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let mut metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+        metadata.row_groups = vec![];
+        let cols = extract_sorting_columns(&metadata).expect("zero row groups is valid");
+        assert!(cols.is_empty());
+    }
+
+    /// A present-but-empty sorting vector is skipped like None, not treated as a
+    /// conflict against a sibling group that declares a real sort column.
+    #[test]
+    fn extract_sorting_columns_skips_empty_present_sorting_columns() {
+        use parquet2::metadata::{RowGroupMetaData, SortingColumn};
+
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let mut metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+
+        metadata.row_groups = vec![
+            // present but empty -> treated as "no sorting columns", skipped.
+            RowGroupMetaData::with_sorting_columns(vec![], 10, Some(vec![]), 0),
+            RowGroupMetaData::with_sorting_columns(
+                vec![],
+                10,
+                Some(vec![SortingColumn::new(0, false, false)]),
+                0,
+            ),
+        ];
+        let cols = extract_sorting_columns(&metadata)
+            .expect("an empty-but-present sorting vector must be skipped, not conflict");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].column_idx, 0);
+    }
+
     fn leak_bytes(data: &[u8]) -> &'static [u8] {
         Box::leak(data.to_vec().into_boxed_slice())
     }
@@ -842,15 +1150,13 @@ mod tests {
 
     #[test]
     fn convert_sorting_columns_propagated() {
+        // Write a parquet file with a designated timestamp. qdb_meta marks the
+        // designated column, which resolve_sorting_columns treats as
+        // authoritative for the _pm sort column -- so it is recorded at its
+        // dense position even when the footer's row groups omit sorting columns.
         let parquet_data = write_test_parquet(100, CompressionOptions::Uncompressed);
         let mut cursor = Cursor::new(&parquet_data);
         let metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
-
-        let has_sorting = metadata.row_groups.iter().any(|rg| {
-            rg.sorting_columns()
-                .as_ref()
-                .is_some_and(|sc| !sc.is_empty())
-        });
 
         let qdb_meta = extract_qdb_meta_from(&metadata);
         let (parquet_meta_bytes, parquet_meta_file_size) = convert_from_parquet(
@@ -866,14 +1172,11 @@ mod tests {
         let reader =
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
 
-        if has_sorting {
-            assert!(reader.sorting_column_count() > 0);
-            assert_eq!(reader.sorting_column(0).unwrap(), 0);
-        } else {
-            assert_eq!(reader.sorting_column_count(), 0);
-        }
-
+        // The designated timestamp (from qdb_meta) is the sole sort column, at
+        // its dense position (0).
         assert!(reader.designated_timestamp().is_some());
+        assert_eq!(reader.sorting_column_count(), 1);
+        assert_eq!(reader.sorting_column(0).unwrap(), 0);
     }
 
     #[test]
