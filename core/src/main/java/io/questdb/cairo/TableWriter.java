@@ -2489,7 +2489,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
         final int partitionDirLen = path.size();
         setPathForNativePartition(other.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, newPartitionNameTxn);
         final int newPartitionDirLen = other.size();
-        linkPartitionIndexFiles(partitionTimestamp, partitionDirLen, newPartitionDirLen);
+        linkPartitionIndexFiles(partitionTimestamp, oldPartitionNameTxn, partitionDirLen, newPartitionDirLen);
     }
 
     public void markDistressed() {
