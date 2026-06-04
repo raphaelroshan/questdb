@@ -124,10 +124,7 @@ pub struct ParquetUpdater {
     parquet_meta_file_size: u64,
     existing_parquet_meta_file_size: i64,
     result_parquet_meta_size: i64,
-    /// Apply-time `seqTxn` for the new `_pm` snapshot. Stamped into every
-    /// `_pm` write (full or update), per the writer invariant in the cold
-    /// storage v1 README. Never inherited from the existing parquet's
-    /// QdbMeta — that value belongs to the prior snapshot.
+    /// Apply-time `seqTxn` for the new `_pm` snapshot.
     seq_txn: SeqTxn,
     // Per-VARCHAR-column "still all-ASCII" tracker, keyed by parquet field_id.
     // Seeded at construction from the old qdb_meta's ascii flag:

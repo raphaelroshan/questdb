@@ -535,6 +535,17 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         this.seqTxn = seqTxn;
     }
 
+    /**
+     * Stamps a native partition's last-modifying seqTxn into the offset-3 word with bit 63
+     * (UPLOADED) masked off, so any write both advances the version and clears UPLOADED.
+     * Use this on the WAL-apply path; resetPartitionParquetGeneratedByRawIndex writes the
+     * -1 "unknown version" sentinel for the non-WAL repair path.
+     */
+    public void stampPartitionSeqTxnByRawIndex(int indexRaw, long seqTxn) {
+        setPartitionParquetGeneratedByRawIndex(indexRaw, false);
+        attachedPartitions.setQuick(indexRaw + PARTITION_PARQUET_FILE_SIZE_OFFSET, seqTxn & PARQUET_FILE_SIZE_VALUE_MASK);
+    }
+
     public void switchPartitions(long timestamp) {
         recordStructureVersion++;
         fixedRowCount += transientRowCount;

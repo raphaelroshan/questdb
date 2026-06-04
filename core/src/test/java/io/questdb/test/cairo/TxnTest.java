@@ -321,6 +321,42 @@ public class TxnTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testSetPartitionUploadedOnStampedNativePartition() throws Exception {
+        // A stamped native partition carries its seqTxn in the file-size slot (offset 3 != -1),
+        // so setPartitionUploaded must no longer trip the "no parquet" (raw == -1) guard, and the
+        // seqTxn value bits must survive toggling UPLOADED.
+        TestUtils.assertMemoryLeak(() -> {
+            FilesFacade ff = engine.getConfiguration().getFilesFacade();
+            assertMemoryLeak(() -> {
+                String tableName = "txnUploadedOnStamped";
+                TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY);
+                model.timestamp();
+                AbstractCairoTest.create(model);
+
+                try (Path path = new Path()) {
+                    TableToken tableToken = engine.verifyTableName(tableName);
+                    path.of(configuration.getDbRoot()).concat(tableToken).concat(TXN_FILE_NAME).$();
+                    try (TxWriter tw = new TxWriter(ff, configuration).ofRW(path.$(), TableUtils.getTimestampType(model), PartitionBy.DAY)) {
+                        long ts = 0;
+                        tw.updatePartitionSizeByTimestamp(ts, 1);
+                        tw.stampPartitionSeqTxnByRawIndex(0, 7L);
+                        Assert.assertEquals(7L, tw.getNativePartitionSeqTxn(0));
+
+                        // does not throw, unlike the -1 sentinel case
+                        tw.setPartitionUploaded(0, true);
+                        Assert.assertTrue(tw.isPartitionUploaded(0));
+                        Assert.assertEquals("seqTxn survives setting UPLOADED", 7L, tw.getNativePartitionSeqTxn(0));
+
+                        tw.setPartitionUploaded(0, false);
+                        Assert.assertFalse(tw.isPartitionUploaded(0));
+                        Assert.assertEquals("seqTxn survives clearing UPLOADED", 7L, tw.getNativePartitionSeqTxn(0));
+                    }
+                }
+            });
+        });
+    }
+
+    @Test
     public void testSetPartitionUploadedRejectsNoParquet() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             FilesFacade ff = engine.getConfiguration().getFilesFacade();
@@ -369,6 +405,71 @@ public class TxnTest extends AbstractCairoTest {
                 Assert.assertEquals(TxReader.PARTITION_SQUASH_COUNTER_MAX, tw.getPartitionSquashCount(0));
             }
         }
+    }
+
+    @Test
+    public void testStampPartitionSeqTxnClearsUploadedAndGenerated() throws Exception {
+        // stampPartitionSeqTxnByRawIndex writes the seqTxn with bit 63 masked off and clears
+        // parquet_generated, leaving a plain native partition whose version reads back.
+        TestUtils.assertMemoryLeak(() -> {
+            FilesFacade ff = engine.getConfiguration().getFilesFacade();
+            assertMemoryLeak(() -> {
+                String tableName = "txnStampSeqTxn";
+                TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY);
+                model.timestamp();
+                AbstractCairoTest.create(model);
+
+                try (Path path = new Path()) {
+                    TableToken tableToken = engine.verifyTableName(tableName);
+                    path.of(configuration.getDbRoot()).concat(tableToken).concat(TXN_FILE_NAME).$();
+                    try (TxWriter tw = new TxWriter(ff, configuration).ofRW(path.$(), TableUtils.getTimestampType(model), PartitionBy.DAY)) {
+                        long ts = 0;
+                        tw.updatePartitionSizeByTimestamp(ts, 1);
+                        // fresh native partition: unknown version
+                        Assert.assertEquals(-1L, tw.getNativePartitionSeqTxn(0));
+
+                        tw.stampPartitionSeqTxnByRawIndex(0, 123L);
+
+                        Assert.assertEquals(123L, tw.getNativePartitionSeqTxn(0));
+                        Assert.assertFalse("stamp clears UPLOADED", tw.isPartitionUploaded(0));
+                        Assert.assertFalse("stamp clears parquet_generated", tw.isPartitionParquetGenerated(0));
+                        Assert.assertFalse("partition stays native", tw.isPartitionParquet(0));
+                    }
+                }
+            });
+        });
+    }
+
+    @Test
+    public void testStampPartitionSeqTxnRestampClearsUploaded() throws Exception {
+        // The WAL-apply invariant: any write (a re-stamp) advances the version and clears a
+        // previously-set UPLOADED bit in the same store.
+        TestUtils.assertMemoryLeak(() -> {
+            FilesFacade ff = engine.getConfiguration().getFilesFacade();
+            assertMemoryLeak(() -> {
+                String tableName = "txnRestampSeqTxn";
+                TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY);
+                model.timestamp();
+                AbstractCairoTest.create(model);
+
+                try (Path path = new Path()) {
+                    TableToken tableToken = engine.verifyTableName(tableName);
+                    path.of(configuration.getDbRoot()).concat(tableToken).concat(TXN_FILE_NAME).$();
+                    try (TxWriter tw = new TxWriter(ff, configuration).ofRW(path.$(), TableUtils.getTimestampType(model), PartitionBy.DAY)) {
+                        long ts = 0;
+                        tw.updatePartitionSizeByTimestamp(ts, 1);
+                        tw.stampPartitionSeqTxnByRawIndex(0, 5L);
+                        tw.setPartitionUploaded(0, true);
+                        Assert.assertTrue(tw.isPartitionUploaded(0));
+
+                        tw.stampPartitionSeqTxnByRawIndex(0, 9L);
+
+                        Assert.assertEquals(9L, tw.getNativePartitionSeqTxn(0));
+                        Assert.assertFalse("re-stamp clears UPLOADED", tw.isPartitionUploaded(0));
+                    }
+                }
+            });
+        });
     }
 
     @Test

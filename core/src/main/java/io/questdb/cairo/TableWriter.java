@@ -376,6 +376,8 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
     private final FragileCode RECOVER_FROM_SWAP_RENAME_FAILURE = this::recoverFromSwapRenameFailure;
     private final FragileCode RECOVER_FROM_COLUMN_OPEN_FAILURE = this::recoverOpenColumnFailure;
     private UpdateOperatorImpl updateOperatorImpl;
+    // seqTxn of the WAL apply in progress, stamped into native partitions; -1 when not applying.
+    private long walApplySeqTxn = -1;
     private long walRowsProcessed;
     private WalTxnDetails walTxnDetails;
     private final ColumnTaskHandler cthMapSymbols = this::processWalCommitBlock_sortWalSegmentTimestamps_dispatchColumnSortTasks_mapSymbols;
@@ -873,6 +875,9 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
     public long apply(AbstractOperation operation, long seqTxn) {
         try {
             setSeqTxn(seqTxn);
+            // A structural command (e.g. CONVERT PARTITION TO NATIVE, ALTER COLUMN TYPE) may
+            // produce native partitions; stamp them with this command's seqTxn.
+            walApplySeqTxn = seqTxn;
             long txnBefore = getTxn();
             long rowsAffected = operation.apply(this, true);
             if (txnBefore == getTxn()) {
@@ -902,6 +907,8 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                         .$(tableToken).$(", error=").$(th2).I$();
             }
             throw th;
+        } finally {
+            walApplySeqTxn = -1;
         }
     }
 
@@ -1203,6 +1210,11 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             for (int i = 0, n = txWriter.getPartitionCount(); i < n; i++) {
                 if (txWriter.isPartitionParquet(i)) {
                     convertPartitionParquetToNative(txWriter.getPartitionTimestampByIndex(i));
+                } else if (txWriter.isPartitionParquetGenerated(i) || txWriter.isPartitionUploaded(i)) {
+                    // convertColumn0 rewrites the native column under a new writer index, but the
+                    // remote/local parquet still holds the old column under the old field id.
+                    txWriter.resetPartitionParquetGeneratedByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
+                    txWriter.bumpPartitionTableVersion();
                 }
             }
             path.trimTo(pathSize);
@@ -1524,6 +1536,8 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                 distressed = true;
             }
             throw e;
+        } finally {
+            walApplySeqTxn = -1;
         }
 
         walTxnDetails.setIncrementRowsCommitted(walRowsProcessed);
@@ -1714,7 +1728,12 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             // used to update txn and bump recordStructureVersion
             txWriter.updatePartitionSizeAndTxnByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION, parquetRowCount);
             txWriter.resetPartitionParquetFormat(partitionTimestamp);
-            txWriter.resetPartitionParquetGenerated(partitionIndex);
+            if (walApplySeqTxn > 0) {
+                // parquet -> native on the WAL-apply path: stamp the apply seqTxn instead of -1.
+                txWriter.stampPartitionSeqTxnByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION, walApplySeqTxn);
+            } else {
+                txWriter.resetPartitionParquetGenerated(partitionIndex);
+            }
             txWriter.bumpPartitionTableVersion();
             commitTxWriter();
 
@@ -2528,15 +2547,14 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             if (!ff.exists(path.$())) {
                 return false;
             }
-            // When parquetGenerated is already set, allow re-marking with a potentially
-            // updated file size. This supports the storage-policy recovery path where a
-            // stale parquet was removed and regenerated with different contents. Skip the
-            // commit if the flag and size are both already up to date.
-            if (txWriter.isPartitionParquetGenerated(partitionIndex)
-                    && txWriter.getPartitionParquetFileSize(partitionIndex) == parquetFileSize) {
+            // Generation only flips the parquet_generated bit; offset 3 keeps the native
+            // seqTxn (the file size lands there only at the TO PARQUET switch, when the
+            // partition becomes read-as-parquet). Already generated -> nothing to do; the
+            // size is re-derived by the uploader and at the switch, never cached here.
+            if (txWriter.isPartitionParquetGenerated(partitionIndex)) {
                 return true;
             }
-            txWriter.setPartitionParquetGenerated(partitionIndex, parquetFileSize);
+            txWriter.setPartitionParquetGenerated(partitionIndex, true);
             txWriter.bumpPartitionTableVersion();
             commitTxWriter();
             return true;
@@ -4033,6 +4051,14 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
         long initialTransientRowCount = txWriter.transientRowCount;
         txWriter.transientRowCount += lagRowCount;
         txWriter.updatePartitionSizeByTimestamp(lastPartitionTimestamp, txWriter.transientRowCount);
+        if (walApplySeqTxn > 0) {
+            // In-order appends to the active partition take this fast path instead of the O3 sink,
+            // so stamp the last (native) partition with the apply seqTxn here too.
+            final int lastRaw = (txWriter.getPartitionCount() - 1) * LONGS_PER_TX_ATTACHED_PARTITION;
+            if (lastRaw >= 0 && !txWriter.isPartitionParquetByRawIndex(lastRaw)) {
+                txWriter.stampPartitionSeqTxnByRawIndex(lastRaw, walApplySeqTxn);
+            }
+        }
         txWriter.setMinTimestamp(Math.min(txWriter.getMinTimestamp(), txWriter.getLagMinTimestamp()));
         txWriter.setLagMinTimestamp(lagMinTimestamp);
         if (txWriter.getLagRowCount() == lagRowCount) {
@@ -8036,7 +8062,12 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                             txWriter.setPartitionParquetFormat(partitionTimestamp, parquetFileSize);
                         } else {
                             txWriter.updatePartitionSizeAndTxnByRawIndex(partitionIndexRaw, srcDataNewPartitionSize);
-                            txWriter.resetPartitionParquetGeneratedByRawIndex(partitionIndexRaw);
+                            if (walApplySeqTxn > 0) {
+                                // WAL mutate stays native: stamp the apply seqTxn (clears UPLOADED).
+                                txWriter.stampPartitionSeqTxnByRawIndex(partitionIndexRaw, walApplySeqTxn);
+                            } else {
+                                txWriter.resetPartitionParquetGeneratedByRawIndex(partitionIndexRaw);
+                            }
                             partitionRemoveCandidates.add(partitionTimestamp, srcNameTxn);
                         }
                         txWriter.bumpPartitionTableVersion();
@@ -8064,6 +8095,14 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                         txWriter.bumpPartitionTableVersion();
                     } else {
                         txWriter.updatePartitionSizeByRawIndex(partitionIndexRaw, partitionTimestamp, srcDataNewPartitionSize);
+                        if (walApplySeqTxn > 0) {
+                            // partitionIndexRaw may be an insertion point for a partition that was just
+                            // inserted, so resolve it by timestamp before stamping a native partition.
+                            final int idx = txWriter.findAttachedPartitionRawIndexByLoTimestamp(partitionTimestamp);
+                            if (idx > -1 && !txWriter.isPartitionParquetByRawIndex(idx)) {
+                                txWriter.stampPartitionSeqTxnByRawIndex(idx, walApplySeqTxn);
+                            }
+                        }
                         if (partitionTimestamp != lastPartitionTimestamp) {
                             txWriter.bumpPartitionTableVersion();
                         }
@@ -9670,6 +9709,8 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
     }
 
     private boolean processWalCommit(Path walPath, long seqTxn, TableWriterPressureControl pressureControl, long commitToTimestamp, long wallClockMicros) {
+        // Stamp native partitions touched by this transaction with its seqTxn (read by o3ConsumePartitionUpdateSink).
+        walApplySeqTxn = seqTxn;
         int walId = walTxnDetails.getWalId(seqTxn);
         long txnMinTs = walTxnDetails.getMinTimestamp(seqTxn);
         long txnMaxTs = walTxnDetails.getMaxTimestamp(seqTxn);
@@ -9746,6 +9787,10 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             int blockTransactionCount,
             TableWriterPressureControl pressureControl
     ) {
+        // The whole block applies as one O3 operation that stamps every touched partition with one
+        // seqTxn, so use the block's last (the committed seqTxn). A partition only O3-touched earlier
+        // in the block is over-stamped; the upload dedup tolerates a too-high version.
+        walApplySeqTxn = startSeqTxn + blockTransactionCount - 1;
         segmentCopyInfo.clear();
         walTxnDetails.prepareCopySegments(startSeqTxn, blockTransactionCount, segmentCopyInfo, denseSymbolMapWriters.size() > 0);
         if (isLastPartitionClosed()) {
@@ -12889,6 +12934,11 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             }
 
             txWriter.updatePartitionSizeByTimestamp(targetPartition, targetFrame.getRowCount());
+            if (txWriter.isPartitionUploaded(targetPartitionIndex)) {
+                // Defense-in-depth: a squash rewrites the target's bytes but preserves offset 3, so
+                // clear any stale UPLOADED bit rather than rely on the upstream write having cleared it.
+                txWriter.setPartitionUploaded(targetPartitionIndex, false);
+            }
             if (!txWriter.incrementPartitionSquashCounter(targetPartitionIndex)) {
                 // The squash counter overflew its 16 bits
                 // To help back to detect partition changes we will save a file inside the partition with the current timestamp

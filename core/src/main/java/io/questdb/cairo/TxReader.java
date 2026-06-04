@@ -275,6 +275,16 @@ public class TxReader implements Closeable, Mutable {
         return minTimestamp;
     }
 
+    /**
+     * Returns a native partition's last-modifying seqTxn from the offset-3 word
+     * (bit 63 UPLOADED masked off), or -1 when the version is unknown. Native-only:
+     * for a parquet partition offset 3 holds the file size, read it via the parquet accessor.
+     */
+    public long getNativePartitionSeqTxn(int partitionIndex) {
+        assert !isPartitionParquet(partitionIndex);
+        return getPartitionParquetFileSizeByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION);
+    }
+
     public long getNextExistingPartitionTimestamp(long timestamp) {
         if (partitionBy == PartitionBy.NONE) {
             return Long.MAX_VALUE;
