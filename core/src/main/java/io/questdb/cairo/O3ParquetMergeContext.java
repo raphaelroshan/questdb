@@ -44,6 +44,7 @@ public class O3ParquetMergeContext implements Closeable {
     private IntList activeColIndices;
     private IntList activeToDecodeIdx;
     private PartitionDescriptor chunkDescriptor;
+    private CairoConfiguration configuration;
     private LongList gapO3Ranges;
     private LongList mergeDstBufs;
     private LongList nullBufs;
@@ -70,7 +71,6 @@ public class O3ParquetMergeContext implements Closeable {
         parquetColumns = new DirectIntList(64, MemoryTag.NATIVE_O3);
         parquetColIdToIdx = new IntIntHashMap();
         parquetMetaReader = new ParquetMetaFileReader();
-        partitionDecoder = ParquetPartitionDecoder.newInstance();
         partitionDescriptor = new OwnedMemoryPartitionDescriptor();
         partitionUpdater = new PartitionUpdater();
         rgO3Ranges = new LongList();
@@ -103,6 +103,7 @@ public class O3ParquetMergeContext implements Closeable {
         activeColIndices = null;
         activeToDecodeIdx = null;
         chunkDescriptor = Misc.free(chunkDescriptor);
+        configuration = null;
         gapO3Ranges = null;
         mergeDstBufs = null;
         nullBufs = null;
@@ -173,7 +174,12 @@ public class O3ParquetMergeContext implements Closeable {
         return parquetMetaReader;
     }
 
-    public ParquetPartitionDecoder getPartitionDecoder() {
+    public ParquetPartitionDecoder getPartitionDecoder(CairoConfiguration configuration) {
+        if (partitionDecoder == null || this.configuration != configuration) {
+            Misc.free(partitionDecoder);
+            partitionDecoder = configuration.newParquetPartitionDecoder();
+            this.configuration = configuration;
+        }
         return partitionDecoder;
     }
 

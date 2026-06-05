@@ -327,7 +327,7 @@ public class TableReader implements Closeable, SymbolTableSource {
     public ParquetPartitionDecoder getAndInitParquetPartitionDecoder(int partitionIndex) {
         ParquetPartitionDecoder decoder = parquetMetaDecoders.getQuick(partitionIndex);
         if (decoder == null) {
-            decoder = ParquetPartitionDecoder.newInstance();
+            decoder = configuration.newParquetPartitionDecoder();
             parquetMetaDecoders.setQuick(partitionIndex, decoder);
         }
         long parquetMetaAddr = getParquetMetadataAddr(partitionIndex);
@@ -361,6 +361,10 @@ public class TableReader implements Closeable, SymbolTableSource {
 
     public ColumnVersionReader getColumnVersionReader() {
         return columnVersionReader;
+    }
+
+    public CairoConfiguration getConfiguration() {
+        return configuration;
     }
 
     public long getDataVersion() {

@@ -34,6 +34,7 @@ import io.questdb.VolumeDefinitions;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreakerConfiguration;
 import io.questdb.cutlass.qwp.codec.QwpServerInfoProvider;
 import io.questdb.cutlass.text.TextConfiguration;
+import io.questdb.griffin.engine.table.parquet.ParquetPartitionDecoder;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.ObjObjHashMap;
 import io.questdb.std.datetime.DateFormat;
@@ -1724,6 +1725,11 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     @Override
     public int maxArrayElementCount() {
         return getDelegate().maxArrayElementCount();
+    }
+
+    @Override
+    public ParquetPartitionDecoder newParquetPartitionDecoder() {
+        return getDelegate().newParquetPartitionDecoder();
     }
 
     public void setDelegate(CairoConfiguration delegate) {

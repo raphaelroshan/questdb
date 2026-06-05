@@ -84,7 +84,7 @@ class AsyncFilteredNegativeLimitRecordCursor implements RecordCursor {
     public AsyncFilteredNegativeLimitRecordCursor(@NotNull CairoConfiguration configuration, int scanDirection) {
         this.record = new PageFrameMemoryRecord(PageFrameMemoryRecord.RECORD_A_LETTER);
         this.hasDescendingOrder = scanDirection == RecordCursorFactory.SCAN_DIRECTION_BACKWARD;
-        this.frameMemoryPool = new PageFrameMemoryPool(configuration.getSqlParquetFrameCacheCapacity());
+        this.frameMemoryPool = new PageFrameMemoryPool(configuration, configuration.getSqlParquetFrameCacheCapacity());
         this.dispatchLimit = configuration.getSqlParallelFilterDispatchLimit();
     }
 

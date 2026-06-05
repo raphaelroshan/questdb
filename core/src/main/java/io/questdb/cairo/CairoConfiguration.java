@@ -36,6 +36,7 @@ import io.questdb.cairo.sql.SqlExecutionCircuitBreakerConfiguration;
 import io.questdb.cutlass.qwp.codec.DefaultQwpServerInfoProvider;
 import io.questdb.cutlass.qwp.codec.QwpServerInfoProvider;
 import io.questdb.cutlass.text.TextConfiguration;
+import io.questdb.griffin.engine.table.parquet.ParquetPartitionDecoder;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.IOURingFacade;
 import io.questdb.std.IOURingFacadeImpl;
@@ -1078,6 +1079,10 @@ public interface CairoConfiguration {
     boolean mangleTableDirNames();
 
     int maxArrayElementCount();
+
+    default ParquetPartitionDecoder newParquetPartitionDecoder() {
+        return new ParquetPartitionDecoder();
+    }
 
     boolean useWithinLatestByOptimisation();
 }

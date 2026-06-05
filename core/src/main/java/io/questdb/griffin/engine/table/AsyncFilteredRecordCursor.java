@@ -75,7 +75,7 @@ class AsyncFilteredRecordCursor implements RecordCursor {
         this.filter = filter;
         this.hasDescendingOrder = scanDirection == RecordCursorFactory.SCAN_DIRECTION_BACKWARD;
         this.record = new PageFrameMemoryRecord(PageFrameMemoryRecord.RECORD_A_LETTER);
-        this.frameMemoryPool = new PageFrameMemoryPool(configuration.getSqlParquetFrameCacheCapacity());
+        this.frameMemoryPool = new PageFrameMemoryPool(configuration, configuration.getSqlParquetFrameCacheCapacity());
         this.defaultDispatchLimit = configuration.getSqlParallelFilterDispatchLimit();
     }
 

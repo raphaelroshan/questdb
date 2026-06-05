@@ -297,7 +297,7 @@ public class SampleByFirstLastRecordCursorFactory extends AbstractRecordCursorFa
         private final static int STATE_SEARCH = 5;
         private final static int STATE_START = 0;
         private final PageFrameAddressCache frameAddressCache;
-        private final PageFrameMemoryPool frameMemoryPool;
+        private PageFrameMemoryPool frameMemoryPool;
         private final SampleByFirstLastRecord record = new SampleByFirstLastRecord();
         private int crossRowState;
         private long currentRow;
@@ -343,9 +343,6 @@ public class SampleByFirstLastRecordCursorFactory extends AbstractRecordCursorFa
                     sampleToFuncPos
             );
             frameAddressCache = new PageFrameAddressCache();
-            // We're using page frame memory only and do single scan
-            // with no random access, hence cache size of 1.
-            frameMemoryPool = new PageFrameMemoryPool(1);
         }
 
         @Override
@@ -715,6 +712,11 @@ public class SampleByFirstLastRecordCursorFactory extends AbstractRecordCursorFa
                 int groupBySymbolKey,
                 SqlExecutionContext sqlExecutionContext
         ) throws SqlException {
+            if (frameMemoryPool == null) {
+                // We're using page frame memory only and do single scan
+                // with no random access, hence cache size of 1.
+                frameMemoryPool = new PageFrameMemoryPool(sqlExecutionContext.getCairoEngine().getConfiguration(), 1);
+            }
             this.frameCursor = frameCursor;
             this.groupBySymbolKey = groupBySymbolKey;
             frameAddressCache.of(metadata, frameCursor.getColumnMapping(), frameCursor.isExternal());

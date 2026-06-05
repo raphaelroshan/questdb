@@ -117,7 +117,7 @@ public class O3PartitionJob extends AbstractQueueConsumerJob<O3PartitionTask> {
         FilesFacade ff = tableWriter.getFilesFacade();
         final O3ParquetMergeContext ctx = PARQUET_MERGE_CONTEXT.get();
         ctx.clear();
-        final ParquetPartitionDecoder partitionDecoder = ctx.getPartitionDecoder();
+        final ParquetPartitionDecoder partitionDecoder = ctx.getPartitionDecoder(cairoConfiguration);
         final RowGroupBuffers rowGroupBuffers = ctx.getRowGroupBuffers();
         final DirectIntList parquetColumns = ctx.getParquetColumns();
         final ParquetMetaFileReader parquetMetaReader = ctx.getParquetMetaReader();

@@ -89,7 +89,7 @@ public class AsyncFilterContext implements Closeable {
         this.perWorkerFilters = perWorkerFilters;
 
         try {
-            ownerMemoryPool = new PageFrameMemoryPool(ownerMemoryPoolCapacity);
+            ownerMemoryPool = new PageFrameMemoryPool(configuration, ownerMemoryPoolCapacity);
             ownerFilteredRows = new DirectLongList(configuration.getPageFrameReduceRowIdListCapacity(), MemoryTag.NATIVE_OFFLOAD);
             if (compiledFilter != null) {
                 ownerDataAddresses = new DirectLongList(configuration.getPageFrameReduceColumnListCapacity(), MemoryTag.NATIVE_OFFLOAD);
@@ -105,7 +105,7 @@ public class AsyncFilterContext implements Closeable {
             perWorkerAuxAddresses = new ObjList<>(slotCount);
             perWorkerSelectivityStats = new ObjList<>(slotCount);
             for (int i = 0; i < slotCount; i++) {
-                perWorkerMemoryPools.extendAndSet(i, new PageFrameMemoryPool(perWorkerMemoryPoolCapacity));
+                perWorkerMemoryPools.extendAndSet(i, new PageFrameMemoryPool(configuration, perWorkerMemoryPoolCapacity));
                 perWorkerFilteredRows.extendAndSet(i, new DirectLongList(configuration.getPageFrameReduceRowIdListCapacity(), MemoryTag.NATIVE_OFFLOAD));
                 if (compiledFilter != null) {
                     perWorkerDataAddresses.extendAndSet(i, new DirectLongList(configuration.getPageFrameReduceColumnListCapacity(), MemoryTag.NATIVE_OFFLOAD));

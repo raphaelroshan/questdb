@@ -24,6 +24,7 @@
 
 package io.questdb.cairo.sql;
 
+import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.Reopenable;
@@ -82,7 +83,7 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
     private ParquetDecoder activeDecoder;
     private PageFrameAddressCache addressCache;
 
-    public PageFrameMemoryPool(int parquetCacheSize) {
+    public PageFrameMemoryPool(CairoConfiguration configuration, int parquetCacheSize) {
         try {
             this.parquetCacheSize = parquetCacheSize;
             cachedParquetBuffers = new ObjList<>(parquetCacheSize);
@@ -93,7 +94,7 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
             columnIdToParquetIdx = new IntIntHashMap(16);
             frameMemory = new PageFrameMemoryImpl();
             parquetColumns = new DirectIntList(32, MemoryTag.NATIVE_DEFAULT, true);
-            parquetMetaDecoder = ParquetPartitionDecoder.newInstance();
+            parquetMetaDecoder = configuration.newParquetPartitionDecoder();
             parquetIdxToDecodeSlot = new IntIntHashMap(16);
             legacyDecoder = new ParquetFileDecoder();
         } catch (Throwable th) {

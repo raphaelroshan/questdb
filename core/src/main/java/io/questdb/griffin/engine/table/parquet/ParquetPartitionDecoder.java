@@ -33,8 +33,6 @@ import io.questdb.std.Os;
 import io.questdb.std.QuietCloseable;
 import io.questdb.std.Unsafe;
 
-import java.util.function.Supplier;
-
 /**
  * Parquet partition decoder that decode row-groups from `data.parquet`
  * but relies on the {@code _pm} sidecar file for metadata.
@@ -45,7 +43,6 @@ import java.util.function.Supplier;
  * separate {@link ParquetFileDecoder} which parses the parquet footer.
  */
 public class ParquetPartitionDecoder implements ParquetDecoder, QuietCloseable {
-    public static volatile Supplier<ParquetPartitionDecoder> SUPPLIER = ParquetPartitionDecoder::new;
     protected final ParquetMetaFileReader parquetMetaReader = new ParquetMetaFileReader();
     protected long allocator;
     protected long decodeContextPtr;
@@ -60,10 +57,6 @@ public class ParquetPartitionDecoder implements ParquetDecoder, QuietCloseable {
 
     public static int decodeRowGroupIndex(long encodedIndex) {
         return (int) ((encodedIndex >> 1) - 1);
-    }
-
-    public static ParquetPartitionDecoder newInstance() {
-        return SUPPLIER.get();
     }
 
     @Override
