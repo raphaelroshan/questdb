@@ -37,6 +37,7 @@ import io.questdb.cairo.DefaultLifecycleManager;
 import io.questdb.cairo.LogRecordSinkAdapter;
 import io.questdb.cairo.MetadataCacheReader;
 import io.questdb.cairo.O3PartitionJob;
+import io.questdb.cairo.ParquetMetaFileReader;
 import io.questdb.cairo.PartitionBy;
 import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableReaderMetadata;
@@ -45,6 +46,7 @@ import io.questdb.cairo.TableToken;
 import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.TableWriter;
 import io.questdb.cairo.TimestampDriver;
+import io.questdb.cairo.TxReader;
 import io.questdb.cairo.arr.ArrayView;
 import io.questdb.cairo.idx.IndexReader;
 import io.questdb.cairo.sql.BindVariableService;
@@ -2077,6 +2079,7 @@ public final class TestUtils {
             StringSink sink
     ) {
         ObjObjHashMap<String, Long> sizes = findPartitionSizes(root, tableName, engine, sink);
+        ObjObjHashMap<String, Long> seqTxns = findPartitionSeqTxns(root, tableName, engine);
         String[] lines = expected.split("\n");
         sink.clear();
         sink.put(lines[0]).put('\n');
@@ -2089,6 +2092,10 @@ public final class TestUtils {
             SizePrettyFunctionFactory.toSizePretty(auxSink, size);
             line = line.replaceAll("SIZE", String.valueOf(size));
             line = line.replaceAll("HUMAN", auxSink.toString());
+            // seqTxn is -1 for non-WAL/legacy native partitions and for detached/attachable
+            // rows absent from the live _txn; a WAL native partition carries a real stamp.
+            Long st = seqTxns.get(nameColumn);
+            line = line.replaceAll("SEQTXN", String.valueOf(st != null ? st : -1L));
             sink.put(line).put('\n');
         }
         return sink.toString();
@@ -2435,6 +2442,50 @@ public final class TestUtils {
             }
         }
         return res;
+    }
+
+    // Independent oracle for the SHOW PARTITIONS / table_partitions() seqTxn column: reads
+    // each live partition's seqTxn straight from _txn (native) or the _pm footer (parquet),
+    // never via the factory under test. Keyed by the rendered partition name. Absent names
+    // (detached/attachable rows) resolve to -1 in the substitution loop, matching the factory.
+    private static ObjObjHashMap<String, Long> findPartitionSeqTxns(
+            Utf8Sequence root,
+            String tableName,
+            CairoEngine engine
+    ) {
+        ObjObjHashMap<String, Long> seqTxns = new ObjObjHashMap<>();
+        TableToken tableToken = engine.verifyTableName(tableName);
+        FilesFacade ff = engine.getConfiguration().getFilesFacade();
+        StringSink nameSink = new StringSink();
+        try (
+                TableReader reader = engine.getReader(tableToken);
+                Path path = new Path().of(root).concat(tableToken)
+        ) {
+            int rootLen = path.size();
+            TxReader txReader = reader.getTxFile();
+            int partitionBy = reader.getPartitionedBy();
+            int timestampType = reader.getMetadata().getTimestampType();
+            for (int i = 0, n = txReader.getPartitionCount(); i < n; i++) {
+                long timestamp = txReader.getPartitionTimestampByIndex(i);
+                nameSink.clear();
+                PartitionBy.setSinkForPartition(nameSink, timestampType, partitionBy, timestamp);
+                long seqTxn;
+                if (txReader.isPartitionParquet(i)) {
+                    // _txn field 3 holds the parquet file size; the seqTxn is in the _pm footer.
+                    path.trimTo(rootLen);
+                    TableUtils.setPathForNativePartition(path, timestampType, partitionBy, timestamp, txReader.getPartitionNameTxn(i));
+                    seqTxn = new ParquetMetaFileReader().readSeqTxnForVersion(
+                            ff,
+                            path.concat(TableUtils.PARQUET_METADATA_FILE_NAME).$(),
+                            txReader.getPartitionParquetFileSize(i)
+                    );
+                } else {
+                    seqTxn = txReader.getNativePartitionSeqTxn(i);
+                }
+                seqTxns.put(nameSink.toString(), seqTxn);
+            }
+        }
+        return seqTxns;
     }
 
     private static ObjObjHashMap<String, Long> findPartitionSizes(

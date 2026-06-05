@@ -125,7 +125,8 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
         IS_ATTACHABLE(12, "attachable", ColumnType.BOOLEAN),
         HAS_PARQUET_GENERATED(13, "hasParquetGenerated", ColumnType.BOOLEAN),
         IS_PARQUET(14, "isParquet", ColumnType.BOOLEAN),
-        PARQUET_FILE_SIZE(15, "parquetFileSize", ColumnType.LONG);
+        PARQUET_FILE_SIZE(15, "parquetFileSize", ColumnType.LONG),
+        SEQ_TXN(16, "seqTxn", ColumnType.LONG);
 
         private final int idx;
         private final TableColumnMetadata metadata;
@@ -169,6 +170,7 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
         private int partitionIndex = -1;
         private long partitionSize = -1L;
         private int rootLen;
+        private long seqTxn;
         private TableReader tableReader;
         private int timestampType;
         private CharSequence tsColName;
@@ -267,6 +269,7 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
             isParquet = false;
             hasParquetGenerated = false;
             parquetFileSize = -1L;
+            seqTxn = -1L;
             minTimestamp = Numbers.LONG_NULL; // so that in absence of metadata is NaN
             maxTimestamp = Long.MIN_VALUE;
             numRows = -1L;
@@ -287,9 +290,18 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
                 isActive = timestamp == tableTxReader.getLastPartitionTimestamp();
                 PartitionBy.setSinkForPartition(partitionName, timestampType, partitionBy, timestamp);
                 TableUtils.setPathForNativePartition(path, timestampType, partitionBy, timestamp, tableTxReader.getPartitionNameTxn(partitionIndex));
-                if (hasParquetGenerated || isParquet) {
+                if (isParquet) {
                     openParquetMeta(path, tableTxReader.getPartitionParquetFileSize(partitionIndex));
+                } else if (hasParquetGenerated) {
+                    // generated-but-not-switched: offset 3 holds the seqTxn, not a size. The local
+                    // data.parquet still exists, so stat it for the real on-disk parquet size.
+                    int dirLen = path.size();
+                    parquetFileSize = ff.length(path.concat(TableUtils.PARQUET_PARTITION_NAME).$());
+                    path.trimTo(dirLen);
                 }
+                seqTxn = isParquet
+                        ? (parquetMetaReader != null && parquetMetaReader.isOpen() ? parquetMetaReader.getResolvedSeqTxn() : -1L)
+                        : tableTxReader.getNativePartitionSeqTxn(partitionIndex);
                 numRows = tableTxReader.getPartitionSize(partitionIndex);
             } else {
                 // partition table is over, we will iterate over detached and attachable partitions
@@ -493,6 +505,7 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
                     case 5 -> numRows;
                     case 6 -> partitionSize;
                     case 15 -> parquetFileSize;
+                    case 16 -> seqTxn;
                     default -> throw new UnsupportedOperationException();
                 };
             }
@@ -546,6 +559,7 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
         metadata.add(Column.HAS_PARQUET_GENERATED.metadata());
         metadata.add(Column.IS_PARQUET.metadata());
         metadata.add(Column.PARQUET_FILE_SIZE.metadata());
+        metadata.add(Column.SEQ_TXN.metadata());
         METADATA_TIMESTAMP = metadata;
         final GenericRecordMetadata metadataNs = new GenericRecordMetadata();
         metadataNs.add(Column.PARTITION_INDEX.metadata());
@@ -564,6 +578,7 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
         metadataNs.add(Column.HAS_PARQUET_GENERATED.metadata());
         metadataNs.add(Column.IS_PARQUET.metadata());
         metadataNs.add(Column.PARQUET_FILE_SIZE.metadata());
+        metadataNs.add(Column.SEQ_TXN.metadata());
         METADATA_TIMESTAMP_NS = metadataNs;
     }
 }

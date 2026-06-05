@@ -441,6 +441,22 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
         return total;
     }
 
+    /**
+     * Reads the seqTxn from the currently resolved footer (the snapshot selected by the
+     * preceding resolveFooter call), reusing the open mapping. Returns -1 when that footer
+     * carries no seqTxn. Caller must hold an open, resolved reader (isOpen()).
+     */
+    public long getResolvedSeqTxn() {
+        assert addr != 0;
+        final long buf = Unsafe.malloc(24, MemoryTag.NATIVE_DEFAULT);
+        try {
+            readPartitionMeta0(addr, resolvedFileSize, buf);
+            return Unsafe.getLong(buf + 16); // seqTxn is the 3rd long of the 24-byte buffer
+        } finally {
+            Unsafe.free(buf, 24, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
     public int getRowGroupCount() {
         return rowGroupCount;
     }
