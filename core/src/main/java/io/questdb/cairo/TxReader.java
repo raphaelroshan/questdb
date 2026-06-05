@@ -482,6 +482,10 @@ public class TxReader implements Closeable, Mutable {
         return lagOrdered;
     }
 
+    public boolean isPartitionCold(int i) {
+        return isPartitionParquet(i) && !isPartitionParquetGenerated(i) && isPartitionUploaded(i);
+    }
+
     public boolean isPartitionParquet(int i) {
         return isPartitionParquetByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
     }

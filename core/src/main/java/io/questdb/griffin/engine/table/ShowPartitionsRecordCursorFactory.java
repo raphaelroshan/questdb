@@ -126,7 +126,8 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
         HAS_PARQUET_GENERATED(13, "hasParquetGenerated", ColumnType.BOOLEAN),
         IS_PARQUET(14, "isParquet", ColumnType.BOOLEAN),
         PARQUET_FILE_SIZE(15, "parquetFileSize", ColumnType.LONG),
-        SEQ_TXN(16, "seqTxn", ColumnType.LONG);
+        SEQ_TXN(16, "seqTxn", ColumnType.LONG),
+        IS_REMOTELY_SERVED(17, "isRemotelyServed", ColumnType.BOOLEAN);
 
         private final int idx;
         private final TableColumnMetadata metadata;
@@ -160,6 +161,7 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
         private boolean isDetached;
         private boolean isParquet;
         private boolean isReadOnly;
+        private boolean isRemotelyServed;
         private int limit; // partitionCount + detached + attachable
         private long maxTimestamp = Long.MIN_VALUE;
         private long minTimestamp = Numbers.LONG_NULL; // so that in absence of metadata is NaN
@@ -268,6 +270,7 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
             isAttachable = false;
             isParquet = false;
             hasParquetGenerated = false;
+            isRemotelyServed = false;
             parquetFileSize = -1L;
             seqTxn = -1L;
             minTimestamp = Numbers.LONG_NULL; // so that in absence of metadata is NaN
@@ -286,6 +289,7 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
                 isReadOnly = tableTxReader.isPartitionReadOnly(partitionIndex);
                 hasParquetGenerated = tableTxReader.isPartitionParquetGenerated(partitionIndex);
                 isParquet = tableTxReader.isPartitionParquet(partitionIndex);
+                isRemotelyServed = tableTxReader.isPartitionCold(partitionIndex);
                 long timestamp = tableTxReader.getPartitionTimestampByIndex(partitionIndex);
                 isActive = timestamp == tableTxReader.getLastPartitionTimestamp();
                 PartitionBy.setSinkForPartition(partitionName, timestampType, partitionBy, timestamp);
@@ -482,9 +486,11 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
                     // hasParquetGenerated=false, isParquet=true. That is harmless internally, but
                     // showed up oddly in SHOW PARTITIONS (a parquet partition reporting "not
                     // generated"). Treat any parquet partition as having a generated parquet file:
-                    // isParquet implies a parquet file was generated for it.
-                    case 13 -> hasParquetGenerated || isParquet;
+                    // isParquet implies a parquet file was generated for it. A cold partition is the
+                    // exception: its local data.parquet was evicted to the bucket, so report false.
+                    case 13 -> (hasParquetGenerated || isParquet) && !isRemotelyServed;
                     case 14 -> isParquet;
+                    case 17 -> isRemotelyServed;
                     default -> throw new UnsupportedOperationException();
                 };
             }
@@ -560,6 +566,7 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
         metadata.add(Column.IS_PARQUET.metadata());
         metadata.add(Column.PARQUET_FILE_SIZE.metadata());
         metadata.add(Column.SEQ_TXN.metadata());
+        metadata.add(Column.IS_REMOTELY_SERVED.metadata());
         METADATA_TIMESTAMP = metadata;
         final GenericRecordMetadata metadataNs = new GenericRecordMetadata();
         metadataNs.add(Column.PARTITION_INDEX.metadata());
@@ -579,6 +586,7 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
         metadataNs.add(Column.IS_PARQUET.metadata());
         metadataNs.add(Column.PARQUET_FILE_SIZE.metadata());
         metadataNs.add(Column.SEQ_TXN.metadata());
+        metadataNs.add(Column.IS_REMOTELY_SERVED.metadata());
         METADATA_TIMESTAMP_NS = metadataNs;
     }
 }
