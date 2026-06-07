@@ -105,20 +105,20 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
 
     @Override
     public void clear() {
+        releaseParquetBuffers();
         Misc.free(parquetMetaDecoder);
         Misc.free(legacyDecoder);
         activeDecoder = null;
         Misc.free(parquetColumns);
-        releaseParquetBuffers();
     }
 
     @Override
     public void close() {
+        releaseParquetBuffers();
         Misc.free(parquetMetaDecoder);
         Misc.free(legacyDecoder);
         activeDecoder = null;
         Misc.free(parquetColumns);
-        releaseParquetBuffers();
         addressCache = null;
     }
 
@@ -536,6 +536,7 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
     private class ParquetBuffers implements QuietCloseable, Reopenable {
         private final DirectLongList auxPageAddresses;
         private final DirectLongList auxPageSizes;
+        private final DirectLongList decodeResources;
         private final DirectLongList pageAddresses;
         private final DirectLongList pageSizes;
         private final RowGroupBuffers rowGroupBuffers;
@@ -547,6 +548,7 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
         public ParquetBuffers() {
             this.auxPageAddresses = new DirectLongList(16, MemoryTag.NATIVE_DEFAULT, true);
             this.auxPageSizes = new DirectLongList(16, MemoryTag.NATIVE_DEFAULT, true);
+            this.decodeResources = new DirectLongList(2, MemoryTag.NATIVE_DEFAULT, true);
             this.pageAddresses = new DirectLongList(16, MemoryTag.NATIVE_DEFAULT, true);
             this.pageSizes = new DirectLongList(16, MemoryTag.NATIVE_DEFAULT, true);
             this.rowGroupBuffers = new RowGroupBuffers(MemoryTag.NATIVE_PARQUET_PARTITION_DECODER, true);
@@ -554,6 +556,8 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
 
         @Override
         public void close() {
+            releaseDecodeResources();
+            Misc.free(decodeResources);
             Misc.free(pageAddresses);
             Misc.free(pageSizes);
             Misc.free(auxPageAddresses);
@@ -564,9 +568,12 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
         }
 
         public void decode(ParquetDecoder decoder, DirectIntList parquetColumns, int rowGroup, int rowLo, int rowHi) {
+            // This buffer is being repurposed for a new frame; drop the prior frame's pins.
+            releaseDecodeResources();
             clearAddresses();
             if (parquetColumns.size() > 0) {
                 decoder.decodeRowGroup(rowGroupBuffers, parquetColumns, rowGroup, rowLo, rowHi);
+                retainDecodeResource(decoder);
             }
             // Always size and zero the page-address lists, even when there are no
             // parquet columns to decode (every projected column was added after this
@@ -595,6 +602,8 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
                 } else {
                     decoder.decodeRowGroupWithRowFilter(rowGroupBuffers, columnOffset, parquetColumns, rowGroup, rowLo, rowHi, filteredRows);
                 }
+                // Second decode pass into the same buffer; keep the prior pins and add this one's.
+                retainDecodeResource(decoder);
                 remapRemainingColumns(columnOffset, filterColumnIndexes);
             }
         }
@@ -605,6 +614,7 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
             pageSizes.reopen();
             auxPageAddresses.reopen();
             auxPageSizes.reopen();
+            decodeResources.reopen();
             rowGroupBuffers.reopen();
         }
 
@@ -619,6 +629,23 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
             list.setCapacity(size);
             list.zero();
             list.setPos(size);
+        }
+
+        // Releases the chunk leases this buffer holds via the cold-aware decoder
+        // (a no-op for the legacy/OSS decoders, which hold no per-decode resource).
+        private void releaseDecodeResources() {
+            for (long i = 0, n = decodeResources.size(); i < n; i++) {
+                parquetMetaDecoder.releaseDecodeResource(decodeResources.get(i));
+            }
+            decodeResources.clear();
+        }
+
+        // Takes ownership of the lease the just-completed decode acquired, if any.
+        private void retainDecodeResource(ParquetDecoder decoder) {
+            final long resource = decoder.takeDecodeResource();
+            if (resource != 0) {
+                decodeResources.add(resource);
+            }
         }
 
         // Fan the decoded buffers out to query columns. parquetColumns is
