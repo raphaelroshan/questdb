@@ -247,10 +247,9 @@ public class ReadParquetFunctionTest extends AbstractCairoTest {
                         parquet file sequential scan
                           columns: a_ts,a_long
                         """;
-                assertPlanNoLeakCheck(
-                        sink,
-                        expectedPlan
-                );
+                assertQuery(sink)
+                        .noLeakCheck()
+                        .assertsPlan(expectedPlan);
 
                 assertSqlCursors0("select a_ts, a_long from x");
             }
@@ -285,10 +284,9 @@ public class ReadParquetFunctionTest extends AbstractCairoTest {
                         """;
                 sink.clear();
                 sink.put("select an_int, a_long, a_str from read_parquet('x.parquet')");
-                assertPlanNoLeakCheck(
-                        sink,
-                        expectedPlan
-                );
+                assertQuery(sink)
+                        .noLeakCheck()
+                        .assertsPlan(expectedPlan);
                 assertSqlCursors0("select an_int, a_long, a_str from x");
             }
         });
@@ -322,10 +320,9 @@ public class ReadParquetFunctionTest extends AbstractCairoTest {
                         parquet file sequential scan
                           columns: a_long
                         """;
-                assertPlanNoLeakCheck(
-                        sink,
-                        expectedPlan
-                );
+                assertQuery(sink)
+                        .noLeakCheck()
+                        .assertsPlan(expectedPlan);
                 assertSqlCursors0("select a_long from x");
             }
         });
@@ -361,10 +358,9 @@ public class ReadParquetFunctionTest extends AbstractCairoTest {
                             parquet file sequential scan
                               columns: a_long
                         """;
-                assertPlanNoLeakCheck(
-                        "select a_long + 1 from read_parquet('x.parquet')",
-                        expectedPlan
-                );
+                assertQuery("select a_long + 1 from read_parquet('x.parquet')")
+                        .noLeakCheck()
+                        .assertsPlan(expectedPlan);
             }
         });
     }
@@ -458,10 +454,9 @@ public class ReadParquetFunctionTest extends AbstractCairoTest {
                         parquet file sequential scan
                           columns: id,ts
                         """;
-                assertPlanNoLeakCheck(
-                        query,
-                        expectedPlan
-                );
+                assertQuery(query)
+                        .noLeakCheck()
+                        .assertsPlan(expectedPlan);
                 assertQuery(query + " limit 10")
                         .noLeakCheck()
                         .timestamp("ts")
@@ -685,16 +680,19 @@ public class ReadParquetFunctionTest extends AbstractCairoTest {
                 sink.put("select * from read_parquet('x.parquet')");
 
                 if (parallel) {
-                    assertPlanNoLeakCheck(sink, """ 
-                            parquet page frame scan
-                              columns: id,a_boolean,a_byte,a_short,an_int,a_long,a_float,a_double,a_varchar,a_uuid,a_date,a_ts,a_ns,designated_ts
-                            """
-                    );
+                    assertQuery(sink)
+                            .noLeakCheck()
+                            .assertsPlan(""" 
+                                    parquet page frame scan
+                                      columns: id,a_boolean,a_byte,a_short,an_int,a_long,a_float,a_double,a_varchar,a_uuid,a_date,a_ts,a_ns,designated_ts
+                                    """);
                 } else {
-                    assertPlanNoLeakCheck(sink, """ 
-                            parquet file sequential scan
-                              columns: id,a_boolean,a_byte,a_short,an_int,a_long,a_float,a_double,a_varchar,a_uuid,a_date,a_ts,a_ns,designated_ts
-                            """);
+                    assertQuery(sink)
+                            .noLeakCheck()
+                            .assertsPlan(""" 
+                                    parquet file sequential scan
+                                      columns: id,a_boolean,a_byte,a_short,an_int,a_long,a_float,a_double,a_varchar,a_uuid,a_date,a_ts,a_ns,designated_ts
+                                    """);
                 }
 
                 sink.put(" where 1 = 2");
