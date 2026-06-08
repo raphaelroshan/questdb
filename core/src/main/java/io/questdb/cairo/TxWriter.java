@@ -443,8 +443,10 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         }
         final int offset = indexRaw + PARTITION_PARQUET_FILE_SIZE_OFFSET;
         final long current = attachedPartitions.getQuick(offset);
-        final long uploadedBit = (current != -1L) ? (current & PARQUET_FILE_SIZE_UPLOADED_BIT) : 0L;
-        attachedPartitions.setQuick(offset, (size & PARQUET_FILE_SIZE_VALUE_MASK) | uploadedBit);
+        // Preserve the whole flag region (UPLOADED + reserved bits), not just UPLOADED, so a
+        // value rewrite never drops a flag. The -1 sentinel carries no flags to preserve.
+        final long flags = (current != -1L) ? (current & PARQUET_FILE_SIZE_FLAGS_MASK) : 0L;
+        attachedPartitions.setQuick(offset, (size & PARQUET_FILE_SIZE_VALUE_MASK) | flags);
     }
 
     public void setPartitionParquetFormat(long timestamp, long fileLength) {
@@ -523,7 +525,7 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         }
         final long updated = isUploaded
                 ? raw | PARQUET_FILE_SIZE_UPLOADED_BIT
-                : raw & PARQUET_FILE_SIZE_VALUE_MASK;
+                : raw & ~PARQUET_FILE_SIZE_UPLOADED_BIT;
         attachedPartitions.setQuick(offset, updated);
     }
 
@@ -536,10 +538,10 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
     }
 
     /**
-     * Stamps a native partition's last-modifying seqTxn into the offset-3 word with bit 63
-     * (UPLOADED) masked off, so any write both advances the version and clears UPLOADED.
-     * Use this on the WAL-apply path; resetPartitionParquetGeneratedByRawIndex writes the
-     * -1 "unknown version" sentinel for the non-WAL repair path.
+     * Stamps a native partition's last-modifying seqTxn into the offset-3 word with the flag
+     * region (UPLOADED + reserved bits) masked off, so any write both advances the version and
+     * clears UPLOADED. Use this on the WAL-apply path; resetPartitionParquetGeneratedByRawIndex
+     * writes the -1 "unknown version" sentinel for the non-WAL repair path.
      */
     public void stampPartitionSeqTxnByRawIndex(int indexRaw, long seqTxn) {
         setPartitionParquetGeneratedByRawIndex(indexRaw, false);

@@ -45,6 +45,21 @@ import static io.questdb.cairo.TableUtils.TXN_FILE_NAME;
 public class ParquetFileSizeMutatorClearsUploadedBitTest extends AbstractCairoTest {
 
     @Test
+    public void testGetPartitionParquetFileSizeMasksReservedFlagBits() throws Exception {
+        // Bits 56..62 are reserved for flags; only bits 0..55 are the value. A raw word with the
+        // reserved region set must read back as the low-56-bit value, never with the flag bits.
+        TestUtils.assertMemoryLeak(() -> withTxWriter("mutReserved", (tw, ts) -> {
+            // setPartitionParquetFormat writes the slot raw; plant reserved bits 56..62 over a 4096 value.
+            tw.setPartitionParquetFormat(ts, (0x7FL << 56) | 4096L);
+
+            Assert.assertEquals("reserved flag bits must be masked off the value",
+                    4096L, tw.getPartitionParquetFileSize(0));
+            Assert.assertFalse("reserved bits 56..62 are distinct from UPLOADED (bit 63)",
+                    tw.isPartitionUploaded(0));
+        }));
+    }
+
+    @Test
     public void testSetPartitionParquetFileSizePreservesUploadedBit() throws Exception {
         // The bit-preserving mutator: set UPLOADED, call
         // setPartitionParquetFileSize with a different size, assert

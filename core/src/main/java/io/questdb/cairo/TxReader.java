@@ -46,8 +46,9 @@ import static io.questdb.cairo.TableUtils.*;
 
 public class TxReader implements Closeable, Mutable {
     public static final long DEFAULT_PARTITION_TIMESTAMP = 0L;
+    public static final long PARQUET_FILE_SIZE_FLAGS_MASK = 0xFFL << 56;
     public static final long PARQUET_FILE_SIZE_UPLOADED_BIT = 1L << 63;
-    public static final long PARQUET_FILE_SIZE_VALUE_MASK = ~PARQUET_FILE_SIZE_UPLOADED_BIT;
+    public static final long PARQUET_FILE_SIZE_VALUE_MASK = ~PARQUET_FILE_SIZE_FLAGS_MASK;
     public static final long PARTITION_FLAGS_MASK = 0x7FFFF00000000000L;
     public static final long PARTITION_SIZE_MASK = 0x80000FFFFFFFFFFFL;
     public static final int PARTITION_SQUASH_COUNTER_MAX = 0xFFFF;
@@ -72,15 +73,16 @@ public class TxReader implements Closeable, Mutable {
     // a negative size value to mean that the partition is not open.
     // the parquet format bit indicates that the partition has been converted to parquet format
     // the parquet generated bit indicates that a parquet file has been generated for the partition
-    // The last long in partition is the parquet file size. Layout:
+    // The last long in a partition record holds, for a parquet-format partition the parquet
+    // file size, and for a native one its last-modifying seqTxn. Layout:
     //   bit 63: UPLOADED
-    //   bits 0..62: file size in bytes
+    //   bits 56..62: reserved for flags (read back masked off via PARQUET_FILE_SIZE_VALUE_MASK)
+    //   bits 0..55: value (file size in bytes, or seqTxn)
     // The sentinel value -1L means "no parquet for this partition" and is recognised before
-    // masking; bit 63 is never inspected on the sentinel.
-    // UPLOADED is implicitly cleared whenever a parquet rewrite stores a fresh non-negative
-    // file size into this slot (bit 63 = 0 by construction). All paths that mutate
-    // data.parquet go through that rewrite, so the bit can never outlive the bytes it claims
-    // were uploaded.
+    // masking; the flag bits are never inspected on the sentinel.
+    // UPLOADED is implicitly cleared whenever a fresh non-negative value is stored raw into
+    // this slot (the flag bits = 0 by construction). All paths that mutate data.parquet go
+    // through that rewrite, so the bit can never outlive the bytes it claims were uploaded.
     protected static final int PARTITION_TS_OFFSET = 0;
     protected final LongList attachedPartitions = new LongList();
     protected final FilesFacade ff;
