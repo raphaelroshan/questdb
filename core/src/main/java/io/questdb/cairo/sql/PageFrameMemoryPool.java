@@ -64,6 +64,7 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
     // Maps column ID (field_id / writer index) to parquet column index.
     // Rebuilt each time openParquet() encounters a new file.
     private final IntIntHashMap columnIdToParquetIdx;
+    private final CairoConfiguration configuration;
     private final PageFrameMemoryImpl frameMemory;
     private final ObjList<ParquetBuffers> freeParquetBuffers;
     private final ParquetFileDecoder legacyDecoder;
@@ -79,9 +80,9 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
     // decode pass (excluded from the include/exclude filter, or absent
     // from the parquet file because it was added later).
     private final IntIntHashMap parquetIdxToDecodeSlot;
-    private final ParquetPartitionDecoder parquetMetaDecoder;
     private ParquetDecoder activeDecoder;
     private PageFrameAddressCache addressCache;
+    private ParquetPartitionDecoder parquetMetaDecoder;
 
     public PageFrameMemoryPool(CairoConfiguration configuration, int parquetCacheSize) {
         try {
@@ -94,7 +95,7 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
             columnIdToParquetIdx = new IntIntHashMap(16);
             frameMemory = new PageFrameMemoryImpl();
             parquetColumns = new DirectIntList(32, MemoryTag.NATIVE_DEFAULT, true);
-            parquetMetaDecoder = configuration.newParquetPartitionDecoder();
+            this.configuration = configuration;
             parquetIdxToDecodeSlot = new IntIntHashMap(16);
             legacyDecoder = new ParquetFileDecoder();
         } catch (Throwable th) {
@@ -277,6 +278,10 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
     private void activateDecoder(int frameIndex) {
         final ParquetDecoder frameDecoder = addressCache.getParquetDecoder(frameIndex);
         if (frameDecoder instanceof ParquetPartitionDecoder parquetMetaFrame) {
+            if (parquetMetaDecoder == null) {
+                // Created lazily so the configuration's decoder factory is fully wired before first use.
+                parquetMetaDecoder = configuration.newParquetPartitionDecoder();
+            }
             if (parquetMetaDecoder.getParquetMetaAddr() != parquetMetaFrame.getParquetMetaAddr() || parquetMetaDecoder.getParquetMetaSize() != parquetMetaFrame.getParquetMetaSize()) {
                 parquetMetaDecoder.of(parquetMetaFrame);
                 buildColumnIdMap(parquetMetaDecoder);
