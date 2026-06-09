@@ -289,7 +289,7 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
                 isReadOnly = tableTxReader.isPartitionReadOnly(partitionIndex);
                 hasParquetGenerated = tableTxReader.isPartitionParquetGenerated(partitionIndex);
                 isParquet = tableTxReader.isPartitionParquet(partitionIndex);
-                isRemotelyServed = tableTxReader.isPartitionCold(partitionIndex);
+                isRemotelyServed = tableTxReader.isPartitionRemotelyServed(partitionIndex);
                 long timestamp = tableTxReader.getPartitionTimestampByIndex(partitionIndex);
                 isActive = timestamp == tableTxReader.getLastPartitionTimestamp();
                 PartitionBy.setSinkForPartition(partitionName, timestampType, partitionBy, timestamp);
@@ -486,8 +486,8 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
                     // hasParquetGenerated=false, isParquet=true. That is harmless internally, but
                     // showed up oddly in SHOW PARTITIONS (a parquet partition reporting "not
                     // generated"). Treat any parquet partition as having a generated parquet file:
-                    // isParquet implies a parquet file was generated for it. A cold partition is the
-                    // exception: its local data.parquet was evicted to the bucket, so report false.
+                    // isParquet implies a parquet file was generated for it. A remotely-served
+                    // partition is the exception: its local data.parquet was evicted, so report false.
                     case 13 -> (hasParquetGenerated || isParquet) && !isRemotelyServed;
                     case 14 -> isParquet;
                     case 17 -> isRemotelyServed;

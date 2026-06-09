@@ -715,7 +715,7 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
         // Verify the CRC32 once per open before trusting any byte of the
         // file. Single-bit disk rot or RAM corruption otherwise passes the
         // structural bound checks and is served as authoritative metadata
-        // steering SQL row-group pruning and cold-storage byte-range reads.
+        // steering SQL row-group pruning and remote-storage byte-range reads.
         // The check parses the file once; the cached flag stops re-verifying
         // on subsequent canSkipRowGroup calls. verifyChecksum0 throws
         // CairoException on mismatch, null pointer, or unparseable file.

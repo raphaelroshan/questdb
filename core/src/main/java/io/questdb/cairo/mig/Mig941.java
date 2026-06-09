@@ -64,7 +64,7 @@ public final class Mig941 {
     private static final long PARQUET_FILE_SIZE_VALUE_MASK = ~(1L << 63);
     private static final int PARQUET_FORMAT_BIT = 61;
     private static final int PARQUET_GENERATED_BIT = 60;
-    private static final long PARQUET_UPLOADED_BIT = 1L << 63;
+    private static final long PARQUET_REMOTE_BIT = 1L << 63;
     private static final int PARTITION_MASKED_SIZE_IDX = 1;
     private static final int PARTITION_NAME_TX_IDX = 2;
     private static final int PARTITION_PARQUET_FILE_SIZE_IDX = 3;
@@ -163,13 +163,13 @@ public final class Mig941 {
                 long rawParquetFileSize = txMem.getLong(entryOffset + PARTITION_PARQUET_FILE_SIZE_IDX * Long.BYTES);
 
                 final boolean parquetGenerated = ((maskedSize >>> PARQUET_GENERATED_BIT) & 1) == 1;
-                final boolean uploaded = rawParquetFileSize != -1L
-                        && (rawParquetFileSize & PARQUET_UPLOADED_BIT) != 0;
-                if (uploaded && !parquetGenerated) {
+                final boolean remote = rawParquetFileSize != -1L
+                        && (rawParquetFileSize & PARQUET_REMOTE_BIT) != 0;
+                if (remote && !parquetGenerated) {
                     continue;
                 }
 
-                // Field 3 carries the UPLOADED marker in bit 63 once a partition is uploaded; the
+                // Field 3 carries the REMOTE marker in bit 63 once a partition has a remote copy; the
                 // actual parquet file size is the low bits. Mask it off before using it as a size,
                 // mirroring TxReader.getPartitionParquetFileSize.
                 long parquetFileSizeFromTxn = rawParquetFileSize == -1L

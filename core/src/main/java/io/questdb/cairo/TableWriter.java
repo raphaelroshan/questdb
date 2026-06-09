@@ -1154,8 +1154,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
 
     /**
      * Bumps the partition table version and commits, invalidating reader caches that pin
-     * partition state. Exposed for the cold-storage extension point so eviction/upload
-     * jobs can publish post-conversion partition changes.
+     * partition state.
      */
     public void bumpPartitionTableVersion() {
         txWriter.bumpPartitionTableVersion();
@@ -1221,7 +1220,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             for (int i = 0, n = txWriter.getPartitionCount(); i < n; i++) {
                 if (txWriter.isPartitionParquet(i)) {
                     convertPartitionParquetToNative(txWriter.getPartitionTimestampByIndex(i));
-                } else if (txWriter.isPartitionParquetGenerated(i) || txWriter.isPartitionUploaded(i)) {
+                } else if (txWriter.isPartitionParquetGenerated(i) || txWriter.isPartitionParquetRemote(i)) {
                     // convertColumn0 rewrites the native column under a new writer index, but the
                     // remote/local parquet still holds the old column under the old field id.
                     txWriter.resetPartitionParquetGeneratedByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
@@ -2558,10 +2557,6 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             if (!ff.exists(path.$())) {
                 return false;
             }
-            // Generation only flips the parquet_generated bit; offset 3 keeps the native
-            // seqTxn (the file size lands there only at the TO PARQUET switch, when the
-            // partition becomes read-as-parquet). Already generated -> nothing to do; the
-            // size is re-derived by the uploader and at the switch, never cached here.
             if (txWriter.isPartitionParquetGenerated(partitionIndex)) {
                 return true;
             }
@@ -8243,7 +8238,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                         } else {
                             txWriter.updatePartitionSizeAndTxnByRawIndex(partitionIndexRaw, srcDataNewPartitionSize);
                             if (walApplySeqTxn > 0) {
-                                // WAL mutate stays native: stamp the apply seqTxn (clears UPLOADED).
+                                // WAL mutate stays native: stamp the apply seqTxn (clears REMOTE).
                                 txWriter.stampPartitionSeqTxnByRawIndex(partitionIndexRaw, walApplySeqTxn);
                             } else {
                                 txWriter.resetPartitionParquetGeneratedByRawIndex(partitionIndexRaw);
@@ -9969,8 +9964,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             TableWriterPressureControl pressureControl
     ) {
         // The whole block applies as one O3 operation that stamps every touched partition with one
-        // seqTxn, so use the block's last (the committed seqTxn). A partition only O3-touched earlier
-        // in the block is over-stamped; the upload dedup tolerates a too-high version.
+        // seqTxn, so use the block's last (the committed seqTxn).
         walApplySeqTxn = startSeqTxn + blockTransactionCount - 1;
         segmentCopyInfo.clear();
         walTxnDetails.prepareCopySegments(startSeqTxn, blockTransactionCount, segmentCopyInfo, denseSymbolMapWriters.size() > 0);
@@ -13298,10 +13292,10 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             }
 
             txWriter.updatePartitionSizeByTimestamp(targetPartition, targetFrame.getRowCount());
-            if (txWriter.isPartitionUploaded(targetPartitionIndex)) {
+            if (txWriter.isPartitionParquetRemote(targetPartitionIndex)) {
                 // Defense-in-depth: a squash rewrites the target's bytes but preserves offset 3, so
-                // clear any stale UPLOADED bit rather than rely on the upstream write having cleared it.
-                txWriter.setPartitionUploaded(targetPartitionIndex, false);
+                // clear any stale REMOTE bit rather than rely on the upstream write having cleared it.
+                txWriter.setPartitionParquetRemote(targetPartitionIndex, false);
             }
             if (!txWriter.incrementPartitionSquashCounter(targetPartitionIndex)) {
                 // The squash counter overflew its 16 bits

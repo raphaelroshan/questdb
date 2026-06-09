@@ -60,8 +60,8 @@ public class CairoException extends RuntimeException implements Sinkable, Flywei
     public static final int METADATA_VERSION_MISMATCH = TXN_BLOCK_APPLY_FAILED - 1;
     public static final int FILE_TOO_SMALL = METADATA_VERSION_MISMATCH - 1;
     public static final int SEQUENCER_METADATA_OPEN_FAILED = FILE_TOO_SMALL - 1;
-    public static final int COLD_PARTITION_STALE = SEQUENCER_METADATA_OPEN_FAILED - 1;
-    public static final int COLD_SNAPSHOT_ID_MISSING = COLD_PARTITION_STALE - 1;
+    public static final int PARTITION_SNAPSHOT_STALE = SEQUENCER_METADATA_OPEN_FAILED - 1;
+    public static final int PARTITION_SNAPSHOT_ID_MISSING = PARTITION_SNAPSHOT_STALE - 1;
     public static final int NON_CRITICAL = -1;
     private static final StackTraceElement[] EMPTY_STACK_TRACE = {};
     private static final ThreadLocal<CairoException> tlException = new ThreadLocal<>(CairoException::new);

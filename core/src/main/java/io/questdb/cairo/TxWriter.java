@@ -443,7 +443,7 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         }
         final int offset = indexRaw + PARTITION_PARQUET_FILE_SIZE_OFFSET;
         final long current = attachedPartitions.getQuick(offset);
-        // Preserve the whole flag region (UPLOADED + reserved bits), not just UPLOADED, so a
+        // Preserve the whole flag region (REMOTE + reserved bits), not just REMOTE, so a
         // value rewrite never drops a flag. The -1 sentinel carries no flags to preserve.
         final long flags = (current != -1L) ? (current & PARQUET_FILE_SIZE_FLAGS_MASK) : 0L;
         attachedPartitions.setQuick(offset, (size & PARQUET_FILE_SIZE_VALUE_MASK) | flags);
@@ -510,27 +510,27 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         setPartitionReadOnlyByRawIndex(findAttachedPartitionRawIndex(timestamp), isReadOnly);
     }
 
-    public void setPartitionUploaded(int partitionIndex, boolean isUploaded) {
-        setPartitionUploadedByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION, isUploaded);
+    public void setPartitionParquetRemote(int partitionIndex, boolean isRemote) {
+        setPartitionParquetRemoteByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION, isRemote);
     }
 
-    public void setPartitionUploadedByRawIndex(int indexRaw, boolean isUploaded) {
+    public void setPartitionParquetRemoteByRawIndex(int indexRaw, boolean isRemote) {
         if (indexRaw < 0) {
             throw CairoException.nonCritical().put("bad partition index -1");
         }
         final int offset = indexRaw + PARTITION_PARQUET_FILE_SIZE_OFFSET;
         final long raw = attachedPartitions.getQuick(offset);
         if (raw == -1L) {
-            throw CairoException.nonCritical().put("cannot set UPLOADED on partition without parquet");
+            throw CairoException.nonCritical().put("cannot set REMOTE bit on partition without parquet");
         }
-        final long updated = isUploaded
-                ? raw | PARQUET_FILE_SIZE_UPLOADED_BIT
-                : raw & ~PARQUET_FILE_SIZE_UPLOADED_BIT;
+        final long updated = isRemote
+                ? raw | PARQUET_FILE_SIZE_REMOTE_BIT
+                : raw & ~PARQUET_FILE_SIZE_REMOTE_BIT;
         attachedPartitions.setQuick(offset, updated);
     }
 
-    public void setPartitionUploadedByTimestamp(long timestamp, boolean isUploaded) {
-        setPartitionUploadedByRawIndex(findAttachedPartitionRawIndex(timestamp), isUploaded);
+    public void setPartitionParquetRemoteByTimestamp(long timestamp, boolean isRemote) {
+        setPartitionParquetRemoteByRawIndex(findAttachedPartitionRawIndex(timestamp), isRemote);
     }
 
     public void setSeqTxn(long seqTxn) {
@@ -539,8 +539,8 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
 
     /**
      * Stamps a native partition's last-modifying seqTxn into the offset-3 word with the flag
-     * region (UPLOADED + reserved bits) masked off, so any write both advances the version and
-     * clears UPLOADED. Use this on the WAL-apply path; resetPartitionParquetGeneratedByRawIndex
+     * region (REMOTE + reserved bits) masked off, so any write both advances the version and
+     * clears REMOTE. Use this on the WAL-apply path; resetPartitionParquetGeneratedByRawIndex
      * writes the -1 "unknown version" sentinel for the non-WAL repair path.
      */
     public void stampPartitionSeqTxnByRawIndex(int indexRaw, long seqTxn) {

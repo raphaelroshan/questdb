@@ -55,7 +55,7 @@ public class ParquetFileSizeMutatorClearsUploadedBitTest extends AbstractCairoTe
             Assert.assertEquals("reserved flag bits must be masked off the value",
                     4096L, tw.getPartitionParquetFileSize(0));
             Assert.assertFalse("reserved bits 56..62 are distinct from UPLOADED (bit 63)",
-                    tw.isPartitionUploaded(0));
+                    tw.isPartitionParquetRemote(0));
         }));
     }
 
@@ -66,14 +66,14 @@ public class ParquetFileSizeMutatorClearsUploadedBitTest extends AbstractCairoTe
         // UPLOADED is preserved AND the masked size matches the new value.
         TestUtils.assertMemoryLeak(() -> withTxWriter("mutPreserve", (tw, ts) -> {
             tw.setPartitionParquetFormat(ts, 4096L);
-            tw.setPartitionUploaded(0, true);
-            Assert.assertTrue(tw.isPartitionUploaded(0));
+            tw.setPartitionParquetRemote(0, true);
+            Assert.assertTrue(tw.isPartitionParquetRemote(0));
             Assert.assertEquals(4096L, tw.getPartitionParquetFileSize(0));
 
             tw.setPartitionParquetFileSize(0, 8192L);
 
             Assert.assertTrue("setPartitionParquetFileSize must preserve UPLOADED",
-                    tw.isPartitionUploaded(0));
+                    tw.isPartitionParquetRemote(0));
             Assert.assertEquals("setPartitionParquetFileSize must overwrite the size",
                     8192L, tw.getPartitionParquetFileSize(0));
         }));
@@ -87,15 +87,15 @@ public class ParquetFileSizeMutatorClearsUploadedBitTest extends AbstractCairoTe
         // bit 63.
         TestUtils.assertMemoryLeak(() -> withTxWriter("mutFormat", (tw, ts) -> {
             tw.setPartitionParquetFormat(ts, 4096L);
-            tw.setPartitionUploaded(0, true);
-            Assert.assertTrue(tw.isPartitionUploaded(0));
+            tw.setPartitionParquetRemote(0, true);
+            Assert.assertTrue(tw.isPartitionParquetRemote(0));
 
             // Call it again with a different size — stand-in for a
             // rewrite path that re-publishes the slot.
             tw.setPartitionParquetFormat(ts, 16_384L);
 
             Assert.assertFalse("setPartitionParquetFormat must clear UPLOADED on size rewrite",
-                    tw.isPartitionUploaded(0));
+                    tw.isPartitionParquetRemote(0));
             Assert.assertEquals("size must equal the new fileLength",
                     16_384L, tw.getPartitionParquetFileSize(0));
         }));
@@ -110,13 +110,13 @@ public class ParquetFileSizeMutatorClearsUploadedBitTest extends AbstractCairoTe
         // the bytes it claims were uploaded.
         TestUtils.assertMemoryLeak(() -> withTxWriter("mutGenerated", (tw, ts) -> {
             tw.setPartitionParquetFormat(ts, 4096L);
-            tw.setPartitionUploaded(0, true);
-            Assert.assertTrue("precondition: UPLOADED must be set", tw.isPartitionUploaded(0));
+            tw.setPartitionParquetRemote(0, true);
+            Assert.assertTrue("precondition: UPLOADED must be set", tw.isPartitionParquetRemote(0));
 
             tw.setPartitionParquetGenerated(0, 8192L);
 
             Assert.assertFalse("setPartitionParquetGenerated(idx, fileLength) must clear UPLOADED",
-                    tw.isPartitionUploaded(0));
+                    tw.isPartitionParquetRemote(0));
             Assert.assertEquals("size must equal the new fileLength",
                     8192L, tw.getPartitionParquetFileSize(0));
             Assert.assertTrue("parquet_generated must be set",

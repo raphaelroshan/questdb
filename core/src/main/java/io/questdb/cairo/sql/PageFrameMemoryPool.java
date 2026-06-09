@@ -659,7 +659,7 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
             list.setPos(size);
         }
 
-        // Releases the chunk leases this buffer holds via the cold-aware decoder
+        // Releases the chunk leases this buffer holds via the remote-aware decoder
         // (a no-op for the legacy/OSS decoders, which hold no per-decode resource).
         private void releaseDecodeResources() {
             for (long i = 0, n = decodeResources.size(); i < n; i++) {

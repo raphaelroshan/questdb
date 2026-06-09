@@ -58,8 +58,8 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                 TxWriter tx = writer.getTxWriter();
                 Assert.assertFalse(tx.isPartitionParquet(0));
                 Assert.assertTrue("day1 must be stamped before staging UPLOADED", tx.getNativePartitionSeqTxn(0) > 0);
-                tx.setPartitionUploaded(0, true);
-                Assert.assertTrue(tx.isPartitionUploaded(0));
+                tx.setPartitionParquetRemote(0, true);
+                Assert.assertTrue(tx.isPartitionParquetRemote(0));
                 writer.bumpPartitionTableVersion();
                 writer.commit();
             }
@@ -70,7 +70,7 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
             try (TableReader reader = getReader("t")) {
                 TxReader tx = reader.getTxFile();
                 Assert.assertFalse("ALTER COLUMN TYPE must clear UPLOADED on the rewritten native partition",
-                        tx.isPartitionUploaded(0));
+                        tx.isPartitionParquetRemote(0));
                 Assert.assertEquals("the slot resets to the unknown-version sentinel",
                         -1L, tx.getNativePartitionSeqTxn(0));
                 Assert.assertFalse(tx.isPartitionParquet(0));
@@ -158,7 +158,7 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                 TxReader tx = reader.getTxFile();
                 Assert.assertEquals(1, tx.getPartitionCount());
                 Assert.assertFalse(tx.isPartitionParquet(0));
-                Assert.assertFalse(tx.isPartitionUploaded(0));
+                Assert.assertFalse(tx.isPartitionParquetRemote(0));
                 // every commit appends to the active partition and stamps it with the committed seqTxn
                 Assert.assertTrue(tx.getSeqTxn() > 0);
                 Assert.assertEquals(tx.getSeqTxn(), tx.getNativePartitionSeqTxn(0));
@@ -184,7 +184,7 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                 Assert.assertEquals(3, tx.getPartitionCount());
                 day1SeqTxn = tx.getNativePartitionSeqTxn(0);
                 Assert.assertTrue(day1SeqTxn > 0);
-                Assert.assertFalse(tx.isPartitionUploaded(0));
+                Assert.assertFalse(tx.isPartitionParquetRemote(0));
             }
 
             // O3 write into day1 (now far behind the active day3) rewrites it and advances its seqTxn
@@ -196,7 +196,7 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                 long newSeqTxn = tx.getSeqTxn();
                 Assert.assertTrue("O3 commit advanced the global seqTxn", newSeqTxn > day1SeqTxn);
                 Assert.assertEquals("day1 restamped to the O3 commit seqTxn", newSeqTxn, tx.getNativePartitionSeqTxn(0));
-                Assert.assertFalse("a write clears UPLOADED", tx.isPartitionUploaded(0));
+                Assert.assertFalse("a write clears UPLOADED", tx.isPartitionParquetRemote(0));
                 Assert.assertFalse(tx.isPartitionParquet(0));
             }
         });

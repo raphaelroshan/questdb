@@ -50,7 +50,7 @@ public class ReadOnlyPartitionWriteBarrierTest extends AbstractCairoTest {
             final long ts = 1_577_836_800_000_000L;
             try (TableWriter writer = getWriter(tt)) {
                 writer.getTxWriter().setPartitionParquetFormat(ts, 1024L);
-                writer.getTxWriter().setPartitionUploaded(0, true);
+                writer.getTxWriter().setPartitionParquetRemote(0, true);
                 writer.getTxWriter().setPartitionReadOnlyByTimestamp(ts, true);
                 writer.bumpPartitionTableVersion();
                 writer.commit();
@@ -61,7 +61,7 @@ public class ReadOnlyPartitionWriteBarrierTest extends AbstractCairoTest {
                 writer.commit();
             }
             try (TableReader reader = engine.getReader(tt)) {
-                Assert.assertTrue(reader.getTxFile().isPartitionUploaded(0));
+                Assert.assertTrue(reader.getTxFile().isPartitionParquetRemote(0));
                 Assert.assertEquals("size swapped to bucket size",
                         2048L, reader.getTxFile().getPartitionParquetFileSize(0));
                 Assert.assertFalse("parquet_generated cleared",
@@ -185,14 +185,14 @@ public class ReadOnlyPartitionWriteBarrierTest extends AbstractCairoTest {
                 writer.bumpPartitionTableVersion();
                 writer.commit();
                 Assert.assertTrue(writer.getTxWriter().isPartitionReadOnly(0));
-                Assert.assertFalse(writer.getTxWriter().isPartitionUploaded(0));
+                Assert.assertFalse(writer.getTxWriter().isPartitionParquetRemote(0));
 
-                writer.getTxWriter().setPartitionUploadedByTimestamp(ts, true);
+                writer.getTxWriter().setPartitionParquetRemoteByTimestamp(ts, true);
                 writer.bumpPartitionTableVersion();
                 writer.commit();
 
                 Assert.assertTrue("UPLOADED bit flip must be allowed on read-only partition",
-                        writer.getTxWriter().isPartitionUploaded(0));
+                        writer.getTxWriter().isPartitionParquetRemote(0));
                 Assert.assertTrue("read_only bit preserved",
                         writer.getTxWriter().isPartitionReadOnly(0));
             }

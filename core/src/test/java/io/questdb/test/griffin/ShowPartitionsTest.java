@@ -247,11 +247,11 @@ public class ShowPartitionsTest extends AbstractCairoTest {
                 TxWriter tx = writer.getTxWriter();
                 Assert.assertTrue("partition must be parquet format", tx.isPartitionParquet(0));
                 tx.setPartitionParquetGenerated(0, false);
-                tx.setPartitionUploaded(0, true);
+                tx.setPartitionParquetRemote(0, true);
                 tx.bumpPartitionTableVersion();
                 tx.commit(writer.getDenseSymbolMapWriters());
                 Assert.assertTrue("partition must remain parquet format", tx.isPartitionParquet(0));
-                Assert.assertTrue("partition must be uploaded", tx.isPartitionUploaded(0));
+                Assert.assertTrue("partition must be uploaded", tx.isPartitionParquetRemote(0));
             }
 
             assertQuery("SELECT name, isParquet, hasParquetGenerated, isRemotelyServed" +

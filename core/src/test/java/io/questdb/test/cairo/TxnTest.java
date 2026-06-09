@@ -226,14 +226,14 @@ public class TxnTest extends AbstractCairoTest {
 
                         // partition 0: native (no parquet) -> sentinel -1L in file size slot
                         Assert.assertEquals(-1L, tw.getPartitionParquetFileSize(0));
-                        Assert.assertFalse(tw.isPartitionUploaded(0));
-                        Assert.assertFalse(tw.isPartitionUploadedByPartitionTimestamp(ts0));
+                        Assert.assertFalse(tw.isPartitionParquetRemote(0));
+                        Assert.assertFalse(tw.isPartitionParquetRemoteByPartitionTimestamp(ts0));
 
                         // partition 1: parquet with file size 1024 -> default UPLOADED=false
                         tw.setPartitionParquetFormat(ts1, 1024L);
                         Assert.assertEquals(1024L, tw.getPartitionParquetFileSize(1));
-                        Assert.assertFalse(tw.isPartitionUploaded(1));
-                        Assert.assertFalse(tw.isPartitionUploadedByPartitionTimestamp(ts1));
+                        Assert.assertFalse(tw.isPartitionParquetRemote(1));
+                        Assert.assertFalse(tw.isPartitionParquetRemoteByPartitionTimestamp(ts1));
                     }
                 }
             });
@@ -261,19 +261,19 @@ public class TxnTest extends AbstractCairoTest {
                         // flip read_only -> UPLOADED still 0
                         tw.setPartitionReadOnlyByTimestamp(ts, true);
                         Assert.assertTrue(tw.isPartitionReadOnly(0));
-                        Assert.assertFalse(tw.isPartitionUploaded(0));
+                        Assert.assertFalse(tw.isPartitionParquetRemote(0));
                         Assert.assertEquals(4096L, tw.getPartitionParquetFileSize(0));
 
                         // flip UPLOADED -> read_only still 1, size still 4096
-                        tw.setPartitionUploaded(0, true);
+                        tw.setPartitionParquetRemote(0, true);
                         Assert.assertTrue(tw.isPartitionReadOnly(0));
-                        Assert.assertTrue(tw.isPartitionUploaded(0));
+                        Assert.assertTrue(tw.isPartitionParquetRemote(0));
                         Assert.assertEquals(4096L, tw.getPartitionParquetFileSize(0));
 
                         // clear read_only -> UPLOADED still 1
                         tw.setPartitionReadOnlyByTimestamp(ts, false);
                         Assert.assertFalse(tw.isPartitionReadOnly(0));
-                        Assert.assertTrue(tw.isPartitionUploaded(0));
+                        Assert.assertTrue(tw.isPartitionParquetRemote(0));
                         Assert.assertEquals(4096L, tw.getPartitionParquetFileSize(0));
                     }
                 }
@@ -301,18 +301,18 @@ public class TxnTest extends AbstractCairoTest {
                         tw.setPartitionParquetFormat(ts, fileLength);
 
                         // set UPLOADED -> getter strips bit, returns original size
-                        tw.setPartitionUploaded(0, true);
-                        Assert.assertTrue(tw.isPartitionUploaded(0));
+                        tw.setPartitionParquetRemote(0, true);
+                        Assert.assertTrue(tw.isPartitionParquetRemote(0));
                         Assert.assertEquals(fileLength, tw.getPartitionParquetFileSize(0));
 
                         // clear UPLOADED -> size still preserved
-                        tw.setPartitionUploadedByTimestamp(ts, false);
-                        Assert.assertFalse(tw.isPartitionUploaded(0));
+                        tw.setPartitionParquetRemoteByTimestamp(ts, false);
+                        Assert.assertFalse(tw.isPartitionParquetRemote(0));
                         Assert.assertEquals(fileLength, tw.getPartitionParquetFileSize(0));
 
                         // round-trip via raw index variant
-                        tw.setPartitionUploadedByRawIndex(0, true);
-                        Assert.assertTrue(tw.isPartitionUploadedByRawIndex(0));
+                        tw.setPartitionParquetRemoteByRawIndex(0, true);
+                        Assert.assertTrue(tw.isPartitionParquetRemoteByRawIndex(0));
                         Assert.assertEquals(fileLength, tw.getPartitionParquetFileSize(0));
                     }
                 }
@@ -323,7 +323,7 @@ public class TxnTest extends AbstractCairoTest {
     @Test
     public void testSetPartitionUploadedOnStampedNativePartition() throws Exception {
         // A stamped native partition carries its seqTxn in the file-size slot (offset 3 != -1),
-        // so setPartitionUploaded must no longer trip the "no parquet" (raw == -1) guard, and the
+        // so setPartitionParquetRemote must no longer trip the "no parquet" (raw == -1) guard, and the
         // seqTxn value bits must survive toggling UPLOADED.
         TestUtils.assertMemoryLeak(() -> {
             FilesFacade ff = engine.getConfiguration().getFilesFacade();
@@ -343,12 +343,12 @@ public class TxnTest extends AbstractCairoTest {
                         Assert.assertEquals(7L, tw.getNativePartitionSeqTxn(0));
 
                         // does not throw, unlike the -1 sentinel case
-                        tw.setPartitionUploaded(0, true);
-                        Assert.assertTrue(tw.isPartitionUploaded(0));
+                        tw.setPartitionParquetRemote(0, true);
+                        Assert.assertTrue(tw.isPartitionParquetRemote(0));
                         Assert.assertEquals("seqTxn survives setting UPLOADED", 7L, tw.getNativePartitionSeqTxn(0));
 
-                        tw.setPartitionUploaded(0, false);
-                        Assert.assertFalse(tw.isPartitionUploaded(0));
+                        tw.setPartitionParquetRemote(0, false);
+                        Assert.assertFalse(tw.isPartitionParquetRemote(0));
                         Assert.assertEquals("seqTxn survives clearing UPLOADED", 7L, tw.getNativePartitionSeqTxn(0));
                     }
                 }
@@ -375,14 +375,14 @@ public class TxnTest extends AbstractCairoTest {
                         // No setPartitionParquetFormat -> file size slot remains -1L sentinel.
 
                         try {
-                            tw.setPartitionUploaded(0, true);
-                            Assert.fail("expected CairoException for setPartitionUploaded on no-parquet partition");
+                            tw.setPartitionParquetRemote(0, true);
+                            Assert.fail("expected CairoException for setPartitionParquetRemote on no-parquet partition");
                         } catch (CairoException ex) {
-                            TestUtils.assertContains(ex.getFlyweightMessage(), "cannot set UPLOADED on partition without parquet");
+                            TestUtils.assertContains(ex.getFlyweightMessage(), "cannot set REMOTE bit on partition without parquet");
                         }
 
                         // partition is unchanged
-                        Assert.assertFalse(tw.isPartitionUploaded(0));
+                        Assert.assertFalse(tw.isPartitionParquetRemote(0));
                         Assert.assertEquals(-1L, tw.getPartitionParquetFileSize(0));
                     }
                 }
@@ -431,7 +431,7 @@ public class TxnTest extends AbstractCairoTest {
                         tw.stampPartitionSeqTxnByRawIndex(0, 123L);
 
                         Assert.assertEquals(123L, tw.getNativePartitionSeqTxn(0));
-                        Assert.assertFalse("stamp clears UPLOADED", tw.isPartitionUploaded(0));
+                        Assert.assertFalse("stamp clears UPLOADED", tw.isPartitionParquetRemote(0));
                         Assert.assertFalse("stamp clears parquet_generated", tw.isPartitionParquetGenerated(0));
                         Assert.assertFalse("partition stays native", tw.isPartitionParquet(0));
                     }
@@ -459,13 +459,13 @@ public class TxnTest extends AbstractCairoTest {
                         long ts = 0;
                         tw.updatePartitionSizeByTimestamp(ts, 1);
                         tw.stampPartitionSeqTxnByRawIndex(0, 5L);
-                        tw.setPartitionUploaded(0, true);
-                        Assert.assertTrue(tw.isPartitionUploaded(0));
+                        tw.setPartitionParquetRemote(0, true);
+                        Assert.assertTrue(tw.isPartitionParquetRemote(0));
 
                         tw.stampPartitionSeqTxnByRawIndex(0, 9L);
 
                         Assert.assertEquals(9L, tw.getNativePartitionSeqTxn(0));
-                        Assert.assertFalse("re-stamp clears UPLOADED", tw.isPartitionUploaded(0));
+                        Assert.assertFalse("re-stamp clears UPLOADED", tw.isPartitionParquetRemote(0));
                     }
                 }
             });
