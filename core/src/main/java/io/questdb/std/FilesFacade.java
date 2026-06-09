@@ -192,6 +192,4 @@ public interface FilesFacade {
     void walk(Path src, FindVisitor func);
 
     long write(long fd, long address, long len, long offset);
-
-    boolean writeNonNegativeLong(long fd, long offset, long value);
 }
