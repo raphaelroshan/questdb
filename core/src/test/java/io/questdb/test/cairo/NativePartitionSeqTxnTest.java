@@ -77,13 +77,12 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
             }
 
             // The rewritten column reads back its values (cast to LONG), not NULL.
-            assertSql(
-                    "ts\tx\n" +
+            assertQuery("SELECT * FROM t ORDER BY ts")
+                    .noLeakCheck().timestamp("ts").expectSize()
+                    .returns("ts\tx\n" +
                             "2024-01-01T00:00:00.000000Z\t10\n" +
                             "2024-01-01T01:00:00.000000Z\t20\n" +
-                            "2024-01-02T00:00:00.000000Z\t30\n",
-                    "SELECT * FROM t ORDER BY ts"
-            );
+                            "2024-01-02T00:00:00.000000Z\t30\n");
         });
     }
 
@@ -132,19 +131,17 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                 Assert.assertTrue(tx.getNativePartitionSeqTxn(1) > 0);
             }
 
-            assertSql(
-                    "index\tisParquet\tparquetFileSize\n" +
+            assertQuery("SELECT index, isParquet, parquetFileSize FROM table_partitions('t')")
+                    .noLeakCheck().noRandomAccess().expectSize()
+                    .returns("index\tisParquet\tparquetFileSize\n" +
                             "0\tfalse\t-1\n" +
-                            "1\tfalse\t-1\n",
-                    "SELECT index, isParquet, parquetFileSize FROM table_partitions('t')"
-            );
+                            "1\tfalse\t-1\n");
 
-            assertSql(
-                    "ts\tx\n" +
+            assertQuery("SELECT * FROM t ORDER BY ts")
+                    .noLeakCheck().timestamp("ts").expectSize()
+                    .returns("ts\tx\n" +
                             "2024-01-01T00:00:00.000000Z\t1\n" +
-                            "2024-01-02T00:00:00.000000Z\t2\n",
-                    "SELECT * FROM t ORDER BY ts"
-            );
+                            "2024-01-02T00:00:00.000000Z\t2\n");
         });
     }
 
