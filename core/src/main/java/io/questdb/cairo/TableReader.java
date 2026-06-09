@@ -456,11 +456,10 @@ public class TableReader implements Closeable, SymbolTableSource {
 
     /**
      * Returns the parquet file size recorded in {@code _txn} for this
-     * partition. Returns {@code 0} for a native partition (the slot is
-     * zero-initialised; {@link TxReader#getPartitionParquetFileSize(int)}
-     * permits {@code 0} for non-parquet partitions). Reading from
-     * {@link TxReader} keeps the size authoritative when the local
-     * {@code data.parquet} mapping is a {@link NullMemoryCMR} (e.g. the
+     * partition, which must be parquet-format: the format bit is the source
+     * of truth and {@link TxReader#getPartitionParquetFileSize(int)} asserts
+     * it. Reading from {@link TxReader} keeps the size authoritative when the
+     * local {@code data.parquet} mapping is a {@link NullMemoryCMR} (e.g. the
      * file has been removed under the reader): {@code _txn} still records
      * the size the file had at commit time, which is what callers like the
      * parquet decoder's footer resolver need.

@@ -38,89 +38,63 @@ import org.junit.Test;
 import static io.questdb.cairo.TableUtils.TXN_FILE_NAME;
 
 /**
- * Every primitive that writes the {@code parquetFileSize} slot — except
- * {@link TxWriter#setPartitionParquetFileSize} — must clear bit 63
- * (UPLOADED) by construction.
+ * Data-rewrite primitives that refresh the parquet file size must clear bit 63
+ * (REMOTE); format-only transitions preserve it.
  */
-public class ParquetFileSizeMutatorClearsUploadedBitTest extends AbstractCairoTest {
+public class ParquetFileSizeMutatorClearsRemoteBitTest extends AbstractCairoTest {
 
     @Test
     public void testGetPartitionParquetFileSizeMasksReservedFlagBits() throws Exception {
         // Bits 56..62 are reserved for flags; only bits 0..55 are the value. A raw word with the
         // reserved region set must read back as the low-56-bit value, never with the flag bits.
         TestUtils.assertMemoryLeak(() -> withTxWriter("mutReserved", (tw, ts) -> {
-            // setPartitionParquetFormat writes the slot raw; plant reserved bits 56..62 over a 4096 value.
-            tw.setPartitionParquetFormat(ts, (0x7FL << 56) | 4096L);
+            // setPartitionParquet writes the slot; plant reserved bits 56..62 over a 4096 value.
+            tw.setPartitionParquet(ts, (0x7FL << 56) | 4096L);
 
             Assert.assertEquals("reserved flag bits must be masked off the value",
                     4096L, tw.getPartitionParquetFileSize(0));
-            Assert.assertFalse("reserved bits 56..62 are distinct from UPLOADED (bit 63)",
-                    tw.isPartitionParquetRemote(0));
+            Assert.assertFalse("reserved bits 56..62 are distinct from REMOTE (bit 63)",
+                    tw.isPartitionRemote(0));
         }));
     }
 
     @Test
-    public void testSetPartitionParquetFileSizePreservesUploadedBit() throws Exception {
-        // The bit-preserving mutator: set UPLOADED, call
-        // setPartitionParquetFileSize with a different size, assert
-        // UPLOADED is preserved AND the masked size matches the new value.
+    public void testSetPartitionParquetFileSizeClearsRemoteBit() throws Exception {
+        // setPartitionParquetFileSize is a data-rewrite mutator: set REMOTE, call
+        // it with a different size, assert REMOTE is cleared and the masked size
+        // matches the new value.
         TestUtils.assertMemoryLeak(() -> withTxWriter("mutPreserve", (tw, ts) -> {
-            tw.setPartitionParquetFormat(ts, 4096L);
-            tw.setPartitionParquetRemote(0, true);
-            Assert.assertTrue(tw.isPartitionParquetRemote(0));
+            tw.setPartitionParquet(ts, 4096L);
+            tw.setPartitionRemote(0, true);
+            Assert.assertTrue(tw.isPartitionRemote(0));
             Assert.assertEquals(4096L, tw.getPartitionParquetFileSize(0));
 
             tw.setPartitionParquetFileSize(0, 8192L);
 
-            Assert.assertTrue("setPartitionParquetFileSize must preserve UPLOADED",
-                    tw.isPartitionParquetRemote(0));
+            Assert.assertFalse("setPartitionParquetFileSize must clear REMOTE",
+                    tw.isPartitionRemote(0));
             Assert.assertEquals("setPartitionParquetFileSize must overwrite the size",
                     8192L, tw.getPartitionParquetFileSize(0));
         }));
     }
 
     @Test
-    public void testSetPartitionParquetFormatClearsUploadedBit() throws Exception {
-        // setPartitionParquetFormat is the other rewrite-path mutator
-        // (DROP NATIVE -> switchNativePartitionWithParquet calls it).
-        // Same invariant: a fresh non-negative size in the slot zeroes
-        // bit 63.
+    public void testSetPartitionParquetPreservesRemoteBit() throws Exception {
+        // setPartitionParquet is a format/materialization transition: the same rows are represented
+        // as parquet, so REMOTE survives.
         TestUtils.assertMemoryLeak(() -> withTxWriter("mutFormat", (tw, ts) -> {
-            tw.setPartitionParquetFormat(ts, 4096L);
-            tw.setPartitionParquetRemote(0, true);
-            Assert.assertTrue(tw.isPartitionParquetRemote(0));
+            tw.setPartitionParquet(ts, 4096L);
+            tw.setPartitionRemote(0, true);
+            Assert.assertTrue(tw.isPartitionRemote(0));
 
             // Call it again with a different size — stand-in for a
             // rewrite path that re-publishes the slot.
-            tw.setPartitionParquetFormat(ts, 16_384L);
+            tw.setPartitionParquet(ts, 16_384L);
 
-            Assert.assertFalse("setPartitionParquetFormat must clear UPLOADED on size rewrite",
-                    tw.isPartitionParquetRemote(0));
+            Assert.assertTrue("setPartitionParquet must preserve REMOTE on format rewrite",
+                    tw.isPartitionRemote(0));
             Assert.assertEquals("size must equal the new fileLength",
                     16_384L, tw.getPartitionParquetFileSize(0));
-        }));
-    }
-
-    @Test
-    public void testSetPartitionParquetGeneratedClearsUploadedBit() throws Exception {
-        // Set UPLOADED on a parquet partition, then call the rewrite-path
-        // mutator setPartitionParquetGenerated(idx, fileLength). The
-        // mutator writes a raw non-negative long into the slot, which
-        // clobbers bit 63 by construction. UPLOADED can never outlive
-        // the bytes it claims were uploaded.
-        TestUtils.assertMemoryLeak(() -> withTxWriter("mutGenerated", (tw, ts) -> {
-            tw.setPartitionParquetFormat(ts, 4096L);
-            tw.setPartitionParquetRemote(0, true);
-            Assert.assertTrue("precondition: UPLOADED must be set", tw.isPartitionParquetRemote(0));
-
-            tw.setPartitionParquetGenerated(0, 8192L);
-
-            Assert.assertFalse("setPartitionParquetGenerated(idx, fileLength) must clear UPLOADED",
-                    tw.isPartitionParquetRemote(0));
-            Assert.assertEquals("size must equal the new fileLength",
-                    8192L, tw.getPartitionParquetFileSize(0));
-            Assert.assertTrue("parquet_generated must be set",
-                    tw.isPartitionParquetGenerated(0));
         }));
     }
 

@@ -223,7 +223,7 @@ public class ShowPartitionsTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testShowPartitionsColdPartition() throws Exception {
+    public void testShowPartitionsRemotelyServedPartition() throws Exception {
         String tableName = testTableName(testName.getMethodName());
         assertMemoryLeak(() -> {
             execute(
@@ -241,17 +241,17 @@ public class ShowPartitionsTest extends AbstractCairoTest {
                 drainWalQueue();
             }
 
-            // Stage the cold shape: clear the generated bit and set UPLOADED on the converted partition.
+            // Stage the remotely-served shape: clear the generated bit and set REMOTE on the converted partition.
             TableToken token = engine.verifyTableName(tableName);
             try (TableWriter writer = engine.getWriter(token, "test")) {
                 TxWriter tx = writer.getTxWriter();
                 Assert.assertTrue("partition must be parquet format", tx.isPartitionParquet(0));
                 tx.setPartitionParquetGenerated(0, false);
-                tx.setPartitionParquetRemote(0, true);
+                tx.setPartitionRemote(0, true);
                 tx.bumpPartitionTableVersion();
                 tx.commit(writer.getDenseSymbolMapWriters());
                 Assert.assertTrue("partition must remain parquet format", tx.isPartitionParquet(0));
-                Assert.assertTrue("partition must be uploaded", tx.isPartitionParquetRemote(0));
+                Assert.assertTrue("partition must be remote", tx.isPartitionRemote(0));
             }
 
             assertQuery("SELECT name, isParquet, hasParquetGenerated, isRemotelyServed" +
@@ -488,7 +488,7 @@ public class ShowPartitionsTest extends AbstractCairoTest {
     @Test
     public void testShowPartitionsParquetFormatWithoutGeneratedFlag() throws Exception {
         // A partition can be in parquet FORMAT while its parquet-generated bit is
-        // cleared. Cold-storage conversions go through
+        // cleared. Parquet conversions go through
         // switchNativePartitionWithParquet and recovery paths can reset the
         // generated bit independently, so isParquet ends up true while the raw
         // parquetGenerated bit is false. SHOW PARTITIONS must report
@@ -785,6 +785,40 @@ public class ShowPartitionsTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testShowPartitionsWhenThereAreNoDetachedNorAttachableMissingTimestampColumn() throws Exception {
+        String tableName = testTableName(testName.getMethodName());
+        createTable(tableName);
+        deleteFile(tableName, "2023-04", "timestamp.d");
+
+        final String finallyExpected = replaceSizeToMatchOS(
+                """
+                        index\tpartitionBy\tname\tminTimestamp\tmaxTimestamp\tnumRows\tdiskSize\tdiskSizeHuman\treadOnly\tactive\tattached\tdetached\tattachable\thasParquetGenerated\tisParquet\tparquetFileSize\tseqTxn\tisRemotelyServed
+                        0\tMONTH\t2023-01\t2023-01-01T06:00:00.000000Z\t2023-01-31T18:00:00.000000Z\t123\tSIZE\tHUMAN\tfalse\tfalse\ttrue\tfalse\tfalse\tfalse\tfalse\t-1\tSEQTXN\tfalse
+                        1\tMONTH\t2023-02\t2023-02-01T00:00:00.000000Z\t2023-02-28T18:00:00.000000Z\t112\tSIZE\tHUMAN\tfalse\tfalse\ttrue\tfalse\tfalse\tfalse\tfalse\t-1\tSEQTXN\tfalse
+                        2\tMONTH\t2023-03\t2023-03-01T00:00:00.000000Z\t2023-03-31T18:00:00.000000Z\t124\tSIZE\tHUMAN\tfalse\tfalse\ttrue\tfalse\tfalse\tfalse\tfalse\t-1\tSEQTXN\tfalse
+                        null\tMONTH\t2023-04\t\t\t120\tSIZE\tHUMAN\tfalse\tfalse\ttrue\tfalse\tfalse\tfalse\tfalse\t-1\tSEQTXN\tfalse
+                        4\tMONTH\t2023-05\t2023-05-01T00:00:00.000000Z\t2023-05-31T18:00:00.000000Z\t124\tSIZE\tHUMAN\tfalse\tfalse\ttrue\tfalse\tfalse\tfalse\tfalse\t-1\tSEQTXN\tfalse
+                        5\tMONTH\t2023-06\t2023-06-01T00:00:00.000000Z\t2023-06-25T00:00:00.000000Z\t97\tSIZE\tHUMAN\tfalse\ttrue\ttrue\tfalse\tfalse\tfalse\tfalse\t-1\tSEQTXN\tfalse
+                        """,
+                tableName, configuration, engine, sink
+        );
+
+        engine.releaseInactive();
+
+        assertQuery("SELECT * FROM table_partitions('" + tableName + "')")
+                .ddl(null)
+                .noRandomAccess()
+                .expectSize()
+                .returns(finallyExpected);
+
+        assertQuery("show partitions from " + tableName)
+                .ddl(null)
+                .noRandomAccess()
+                .expectSize()
+                .returns(finallyExpected);
+    }
+
+    @Test
     public void testShowPartitionsWithParquetPartition() throws Exception {
         String tableName = testTableName(testName.getMethodName());
         assertMemoryLeak(() -> {
@@ -818,40 +852,6 @@ public class ShowPartitionsTest extends AbstractCairoTest {
                             2023-01-03\t2023-01-03T00:00:00.000000Z\t2023-01-03T00:00:00.000000Z\t1\tfalse
                             """);
         });
-    }
-
-    @Test
-    public void testShowPartitionsWhenThereAreNoDetachedNorAttachableMissingTimestampColumn() throws Exception {
-        String tableName = testTableName(testName.getMethodName());
-        createTable(tableName);
-        deleteFile(tableName, "2023-04", "timestamp.d");
-
-        final String finallyExpected = replaceSizeToMatchOS(
-                """
-                        index\tpartitionBy\tname\tminTimestamp\tmaxTimestamp\tnumRows\tdiskSize\tdiskSizeHuman\treadOnly\tactive\tattached\tdetached\tattachable\thasParquetGenerated\tisParquet\tparquetFileSize\tseqTxn\tisRemotelyServed
-                        0\tMONTH\t2023-01\t2023-01-01T06:00:00.000000Z\t2023-01-31T18:00:00.000000Z\t123\tSIZE\tHUMAN\tfalse\tfalse\ttrue\tfalse\tfalse\tfalse\tfalse\t-1\tSEQTXN\tfalse
-                        1\tMONTH\t2023-02\t2023-02-01T00:00:00.000000Z\t2023-02-28T18:00:00.000000Z\t112\tSIZE\tHUMAN\tfalse\tfalse\ttrue\tfalse\tfalse\tfalse\tfalse\t-1\tSEQTXN\tfalse
-                        2\tMONTH\t2023-03\t2023-03-01T00:00:00.000000Z\t2023-03-31T18:00:00.000000Z\t124\tSIZE\tHUMAN\tfalse\tfalse\ttrue\tfalse\tfalse\tfalse\tfalse\t-1\tSEQTXN\tfalse
-                        null\tMONTH\t2023-04\t\t\t120\tSIZE\tHUMAN\tfalse\tfalse\ttrue\tfalse\tfalse\tfalse\tfalse\t-1\tSEQTXN\tfalse
-                        4\tMONTH\t2023-05\t2023-05-01T00:00:00.000000Z\t2023-05-31T18:00:00.000000Z\t124\tSIZE\tHUMAN\tfalse\tfalse\ttrue\tfalse\tfalse\tfalse\tfalse\t-1\tSEQTXN\tfalse
-                        5\tMONTH\t2023-06\t2023-06-01T00:00:00.000000Z\t2023-06-25T00:00:00.000000Z\t97\tSIZE\tHUMAN\tfalse\ttrue\ttrue\tfalse\tfalse\tfalse\tfalse\t-1\tSEQTXN\tfalse
-                        """,
-                tableName, configuration, engine, sink
-        );
-
-        engine.releaseInactive();
-
-        assertQuery("SELECT * FROM table_partitions('" + tableName + "')")
-                .ddl(null)
-                .noRandomAccess()
-                .expectSize()
-                .returns(finallyExpected);
-
-        assertQuery("show partitions from " + tableName)
-                .ddl(null)
-                .noRandomAccess()
-                .expectSize()
-                .returns(finallyExpected);
     }
 
     private static void deleteFile(String tableName, String... pathParts) {

@@ -42,27 +42,28 @@ import org.junit.Test;
 public class ReadOnlyPartitionWriteBarrierTest extends AbstractCairoTest {
 
     @Test
-    public void testColdSwitchOnReadOnlyPartitionAllowed() throws Exception {
+    public void testRemoteSwitchOnReadOnlyPartitionAllowed() throws Exception {
         assertMemoryLeak(() -> {
             execute("CREATE TABLE t_rw_cs (x LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
             execute("INSERT INTO t_rw_cs VALUES (1, '2020-01-01T00:00:00'), (2, '2020-01-02T00:00:00')");
             final TableToken tt = engine.verifyTableName("t_rw_cs");
             final long ts = 1_577_836_800_000_000L;
             try (TableWriter writer = getWriter(tt)) {
-                writer.getTxWriter().setPartitionParquetFormat(ts, 1024L);
-                writer.getTxWriter().setPartitionParquetRemote(0, true);
+                writer.getTxWriter().setPartitionParquet(ts, 1024L);
+                writer.getTxWriter().setPartitionRemote(0, true);
                 writer.getTxWriter().setPartitionReadOnlyByTimestamp(ts, true);
                 writer.bumpPartitionTableVersion();
                 writer.commit();
 
-                writer.getTxWriter().setPartitionParquetFileSize(0, 2048L);
+                writer.getTxWriter().setPartitionParquet(ts, 2048L);
                 writer.getTxWriter().setPartitionParquetGenerated(0, false);
+                writer.getTxWriter().setPartitionRemote(0, true);
                 writer.bumpPartitionTableVersion();
                 writer.commit();
             }
             try (TableReader reader = engine.getReader(tt)) {
-                Assert.assertTrue(reader.getTxFile().isPartitionParquetRemote(0));
-                Assert.assertEquals("size swapped to bucket size",
+                Assert.assertTrue(reader.getTxFile().isPartitionRemote(0));
+                Assert.assertEquals("size swapped to the new size",
                         2048L, reader.getTxFile().getPartitionParquetFileSize(0));
                 Assert.assertFalse("parquet_generated cleared",
                         reader.getTxFile().isPartitionParquetGenerated(0));
@@ -173,26 +174,26 @@ public class ReadOnlyPartitionWriteBarrierTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testUploadedBitFlipOnReadOnlyPartitionAllowed() throws Exception {
+    public void testRemoteBitFlipOnReadOnlyPartitionAllowed() throws Exception {
         assertMemoryLeak(() -> {
             execute("CREATE TABLE t_rw_up (x LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
             execute("INSERT INTO t_rw_up VALUES (1, '2020-01-01T00:00:00'), (2, '2020-01-02T00:00:00')");
             final TableToken tt = engine.verifyTableName("t_rw_up");
             final long ts = 1_577_836_800_000_000L;
             try (TableWriter writer = getWriter(tt)) {
-                writer.getTxWriter().setPartitionParquetFormat(ts, 4096L);
+                writer.getTxWriter().setPartitionParquet(ts, 4096L);
                 writer.getTxWriter().setPartitionReadOnlyByTimestamp(ts, true);
                 writer.bumpPartitionTableVersion();
                 writer.commit();
                 Assert.assertTrue(writer.getTxWriter().isPartitionReadOnly(0));
-                Assert.assertFalse(writer.getTxWriter().isPartitionParquetRemote(0));
+                Assert.assertFalse(writer.getTxWriter().isPartitionRemote(0));
 
-                writer.getTxWriter().setPartitionParquetRemoteByTimestamp(ts, true);
+                writer.getTxWriter().setPartitionRemoteByTimestamp(ts, true);
                 writer.bumpPartitionTableVersion();
                 writer.commit();
 
-                Assert.assertTrue("UPLOADED bit flip must be allowed on read-only partition",
-                        writer.getTxWriter().isPartitionParquetRemote(0));
+                Assert.assertTrue("REMOTE bit flip must be allowed on read-only partition",
+                        writer.getTxWriter().isPartitionRemote(0));
                 Assert.assertTrue("read_only bit preserved",
                         writer.getTxWriter().isPartitionReadOnly(0));
             }

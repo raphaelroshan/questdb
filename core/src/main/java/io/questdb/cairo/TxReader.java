@@ -46,19 +46,20 @@ import static io.questdb.cairo.TableUtils.*;
 
 public class TxReader implements Closeable, Mutable {
     public static final long DEFAULT_PARTITION_TIMESTAMP = 0L;
-    public static final long PARQUET_FILE_SIZE_FLAGS_MASK = 0xFFL << 56;
-    public static final long PARQUET_FILE_SIZE_REMOTE_BIT = 1L << 63;
-    public static final long PARQUET_FILE_SIZE_VALUE_MASK = ~PARQUET_FILE_SIZE_FLAGS_MASK;
     public static final long PARTITION_FLAGS_MASK = 0x7FFFF00000000000L;
+    // Flag in the high byte of the offset-3 partition-version word: a remote copy of the
+    // partition's parquet data exists. Only ever set on parquet partitions.
+    public static final long PARTITION_PARQUET_REMOTE_BIT = 1L << 63;
     public static final long PARTITION_SIZE_MASK = 0x80000FFFFFFFFFFFL;
     public static final int PARTITION_SQUASH_COUNTER_MAX = 0xFFFF;
+    public static final long PARTITION_VERSION_FLAGS_MASK = 0xFFL << 56;
+    public static final long PARTITION_VERSION_VALUE_MASK = ~PARTITION_VERSION_FLAGS_MASK;
     protected static final int NONE_COL_STRUCTURE_VERSION = Integer.MIN_VALUE;
     protected static final int PARTITION_MASKED_SIZE_OFFSET = 1;
-    protected static final int PARTITION_MASK_PARQUET_GENERATED_BIT_OFFSET = 60;
     protected static final int PARTITION_MASK_PARQUET_FORMAT_BIT_OFFSET = 61;
+    protected static final int PARTITION_MASK_PARQUET_GENERATED_BIT_OFFSET = 60;
     protected static final int PARTITION_MASK_READ_ONLY_BIT_OFFSET = 62;
     protected static final int PARTITION_NAME_TX_OFFSET = 2;
-    protected static final int PARTITION_PARQUET_FILE_SIZE_OFFSET = 3;
     protected static final int PARTITION_SQUASH_COUNTER_BIT_OFFSET = 44;
     protected static final long PARTITION_SQUASH_COUNTER_MASK = 0xFFFFL << PARTITION_SQUASH_COUNTER_BIT_OFFSET;
     // partition size's highest possible value is 0xFFFFFFFFFFFL (15 Tera Rows):
@@ -73,17 +74,17 @@ public class TxReader implements Closeable, Mutable {
     // a negative size value to mean that the partition is not open.
     // the parquet format bit indicates that the partition has been converted to parquet format
     // the parquet generated bit indicates that a parquet file has been generated for the partition
-    // The last long in a partition record holds, for a parquet-format partition the parquet
-    // file size, and for a native one its last-modifying seqTxn. Layout:
-    //   bit 63: REMOTE
-    //   bits 56..62: reserved for flags (read back masked off via PARQUET_FILE_SIZE_VALUE_MASK)
-    //   bits 0..55: value (file size in bytes, or seqTxn)
-    // The sentinel value -1L means "no parquet for this partition" and is recognised before
-    // masking; the flag bits are never inspected on the sentinel.
-    // REMOTE is implicitly cleared whenever a fresh non-negative value is stored raw into
-    // this slot (the flag bits = 0 by construction). All paths that mutate data.parquet go
-    // through that rewrite, so the bit can never outlive the bytes it claims have a remote copy.
+    // the last long (PARTITION_VERSION_OFFSET) holds, for a parquet partition the parquet file
+    // size, for a native one its last-modifying seqTxn:
+    //
+    // |  remote  | reserved | value (parquet file size / native seqTxn) |
+    // +----------+----------+-------------------------------------------+
+    // |  1 bit   |  7 bits  |                 56 bits                   |
+    //
+    // remote clears by construction on any value write, so it can never outlive the bytes it vouches for.
+    // legacy: a cleared slot reads as 0L (written today) or -1L (older binaries), both folded by isPartitionOffset3Cleared().
     protected static final int PARTITION_TS_OFFSET = 0;
+    protected static final int PARTITION_VERSION_OFFSET = 3;
     protected final LongList attachedPartitions = new LongList();
     protected final FilesFacade ff;
     private final IntList symbolCountSnapshot = new IntList();
@@ -284,7 +285,7 @@ public class TxReader implements Closeable, Mutable {
      */
     public long getNativePartitionSeqTxn(int partitionIndex) {
         assert !isPartitionParquet(partitionIndex);
-        return getPartitionParquetFileSizeByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION);
+        return getPartitionVersionByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION);
     }
 
     public long getNextExistingPartitionTimestamp(long timestamp) {
@@ -373,13 +374,10 @@ public class TxReader implements Closeable, Mutable {
     }
 
     public long getPartitionParquetFileSize(int partitionIndex) {
-        final long fileSize = getPartitionParquetFileSizeByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION);
-        assert fileSize > 0 || !isPartitionParquet(partitionIndex);
+        assert isPartitionParquet(partitionIndex) : "parquet file size read on a native partition";
+        final long fileSize = getPartitionVersionByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION);
+        assert fileSize > 0;
         return fileSize;
-    }
-
-    public long getPartitionParquetFileSizeOrSeqTxn(int partitionIndex) {
-        return getPartitionParquetFileSizeByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION);
     }
 
     public long getPartitionRowCountByTimestamp(long ts) {
@@ -416,6 +414,15 @@ public class TxReader implements Closeable, Mutable {
             return attachedPartitions.getQuick(indexRaw + PARTITION_TS_OFFSET);
         }
         return getPartitionFloor(timestamp);
+    }
+
+    /**
+     * Returns the partition-version value from the offset-3 word (flag bits masked off): the
+     * parquet file size for a parquet-format partition, or the last-modifying seqTxn for a native
+     * one. Distinct from {@link #getPartitionTableVersion()}, which versions the partition list.
+     */
+    public long getPartitionVersion(int partitionIndex) {
+        return getPartitionVersionByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION);
     }
 
     public long getRecordSize() {
@@ -488,12 +495,16 @@ public class TxReader implements Closeable, Mutable {
         return lagOrdered;
     }
 
-    public boolean isPartitionRemotelyServed(int i) {
-        return isPartitionParquet(i) && !isPartitionParquetGenerated(i) && isPartitionParquetRemote(i);
-    }
-
     public boolean isPartitionParquet(int i) {
         return isPartitionParquetByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
+    }
+
+    public boolean isPartitionParquetByPartitionTimestamp(long ts) {
+        int indexRaw = findAttachedPartitionRawIndexByLoTimestamp(ts);
+        if (indexRaw > -1) {
+            return isPartitionParquetByRawIndex(indexRaw);
+        }
+        return false;
     }
 
     public boolean isPartitionParquetByRawIndex(int indexRaw) {
@@ -508,14 +519,6 @@ public class TxReader implements Closeable, Mutable {
         return isPartitionReadOnlyByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
     }
 
-    public boolean isPartitionParquetByPartitionTimestamp(long ts) {
-        int indexRaw = findAttachedPartitionRawIndexByLoTimestamp(ts);
-        if (indexRaw > -1) {
-            return isPartitionParquetByRawIndex(indexRaw);
-        }
-        return false;
-    }
-
     public boolean isPartitionReadOnlyByPartitionTimestamp(long ts) {
         int indexRaw = findAttachedPartitionRawIndexByLoTimestamp(ts);
         if (indexRaw > -1) {
@@ -528,21 +531,24 @@ public class TxReader implements Closeable, Mutable {
         return checkPartitionOptionBit(indexRaw, PARTITION_MASK_READ_ONLY_BIT_OFFSET);
     }
 
-    public boolean isPartitionParquetRemote(int i) {
-        return isPartitionParquetRemoteByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
+    public boolean isPartitionRemote(int i) {
+        return isPartitionRemoteByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
     }
 
-    public boolean isPartitionParquetRemoteByPartitionTimestamp(long ts) {
+    public boolean isPartitionRemoteByPartitionTimestamp(long ts) {
         int indexRaw = findAttachedPartitionRawIndexByLoTimestamp(ts);
         if (indexRaw > -1) {
-            return isPartitionParquetRemoteByRawIndex(indexRaw);
+            return isPartitionRemoteByRawIndex(indexRaw);
         }
         return false;
     }
 
-    public boolean isPartitionParquetRemoteByRawIndex(int indexRaw) {
-        final long raw = attachedPartitions.getQuick(indexRaw + PARTITION_PARQUET_FILE_SIZE_OFFSET);
-        return raw != -1L && (raw & PARQUET_FILE_SIZE_REMOTE_BIT) != 0;
+    public boolean isPartitionRemoteByRawIndex(int indexRaw) {
+        return (getPartitionOffset3(indexRaw) & PARTITION_PARQUET_REMOTE_BIT) != 0;
+    }
+
+    public boolean isPartitionRemotelyServed(int i) {
+        return isPartitionParquet(i) && !isPartitionParquetGenerated(i) && isPartitionRemote(i);
     }
 
     /**
@@ -617,7 +623,7 @@ public class TxReader implements Closeable, Mutable {
             }
 
             long nameTxn = getPartitionNameTxnByRawIndex(i);
-            long parquetSize = getPartitionParquetFileSizeByRawIndex(i);
+            long parquetSize = getPartitionVersionByRawIndex(i);
 
             if (i > 0) {
                 sink.put(",");
@@ -777,12 +783,9 @@ public class TxReader implements Closeable, Mutable {
         return roTxMemBase.getLong(baseOffset + readOffset);
     }
 
-    private long getPartitionParquetFileSizeByRawIndex(int partitionRawIndex) {
-        final long raw = attachedPartitions.getQuick(partitionRawIndex + PARTITION_PARQUET_FILE_SIZE_OFFSET);
-        if (raw == -1L) {
-            return -1L;
-        }
-        return raw & PARQUET_FILE_SIZE_VALUE_MASK;
+    private long getPartitionVersionByRawIndex(int partitionRawIndex) {
+        final long word = attachedPartitions.getQuick(partitionRawIndex + PARTITION_VERSION_OFFSET);
+        return isPartitionOffset3Cleared(word) ? -1L : (word & PARTITION_VERSION_VALUE_MASK);
     }
 
     private boolean isPartitionParquetGeneratedByRawIndex(int indexRaw) {
@@ -877,6 +880,10 @@ public class TxReader implements Closeable, Mutable {
         return attachedPartitions.getQuick(index + PARTITION_MASKED_SIZE_OFFSET) & PARTITION_SIZE_MASK;
     }
 
+    protected static boolean isPartitionOffset3Cleared(long word) {
+        return word == -1L || word == 0L;
+    }
+
     void clearData() {
         baseOffset = 0;
         size = 0;
@@ -911,6 +918,11 @@ public class TxReader implements Closeable, Mutable {
         return attachedPartitions.binarySearchBlock(LONGS_PER_TX_ATTACHED_PARTITION_MSB, ts, Vect.BIN_SEARCH_SCAN_UP);
     }
 
+    protected long getPartitionOffset3(int rawIndex) {
+        final long word = attachedPartitions.getQuick(rawIndex + PARTITION_VERSION_OFFSET);
+        return isPartitionOffset3Cleared(word) ? 0L : word;
+    }
+
     int getPartitionSquashCountByRawIndex(int indexRaw) {
         long partitionSizeMasked = attachedPartitions.getQuick(indexRaw + PARTITION_MASKED_SIZE_OFFSET);
         return (int) ((partitionSizeMasked >>> PARTITION_SQUASH_COUNTER_BIT_OFFSET) & PARTITION_SQUASH_COUNTER_MAX);
@@ -920,7 +932,7 @@ public class TxReader implements Closeable, Mutable {
         attachedPartitions.setQuick(index + PARTITION_TS_OFFSET, partitionTimestampLo);
         attachedPartitions.setQuick(index + PARTITION_MASKED_SIZE_OFFSET, partitionSize & PARTITION_SIZE_MASK);
         attachedPartitions.setQuick(index + PARTITION_NAME_TX_OFFSET, partitionNameTxn);
-        attachedPartitions.setQuick(index + PARTITION_PARQUET_FILE_SIZE_OFFSET, -1L);
+        attachedPartitions.setQuick(index + PARTITION_VERSION_OFFSET, 0L);
     }
 
     protected void switchRecord(int readBaseOffset, long readRecordSize) {

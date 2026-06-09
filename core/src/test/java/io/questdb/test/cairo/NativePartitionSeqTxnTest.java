@@ -24,27 +24,35 @@
 
 package io.questdb.test.cairo;
 
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.PartitionBy;
 import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.TableWriter;
 import io.questdb.cairo.TxReader;
 import io.questdb.cairo.TxWriter;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.str.Path;
 import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
 /**
  * The WAL apply stamps each native partition's last-modifying seqTxn into the _txn parquet-file-size
- * word (bit 63 UPLOADED masked off), so every instance holds a deterministic per-partition version.
+ * word (bit 63 REMOTE masked off), so every instance holds a deterministic per-partition version.
  * Converting a partition to parquet overwrites the slot with the file size.
  */
 public class NativePartitionSeqTxnTest extends AbstractCairoTest {
 
     @Test
-    public void testChangeColumnTypeOnUploadedNativePartitionClearsUploaded() throws Exception {
-        // A native partition with UPLOADED set has its bytes rewritten under a new writer index by
-        // ALTER COLUMN TYPE. The changeColumnType pre-pass must clear UPLOADED (reset the slot to -1)
-        // so the partition re-uploads, rather than a cold read mapping the new index to a missing
-        // parquet field id and decoding the column as NULL.
+    public void testChangeColumnTypeOnRemoteNativePartitionClearsRemote() throws Exception {
+        // A native partition with REMOTE set has its bytes rewritten under a new writer index by
+        // ALTER COLUMN TYPE. The changeColumnType pre-pass must clear REMOTE, stamping the ALTER's
+        // seqTxn as the partition's fresh version (a real version is available on WAL, so the slot
+        // advances rather than dropping to the -1 sentinel), so the partition's remote copy is invalidated instead of
+        // a read of the stale remote parquet mapping the new column index to a missing field id and decoding it as NULL.
         assertMemoryLeak(() -> {
             execute("CREATE TABLE t (ts TIMESTAMP, x INT) TIMESTAMP(ts) PARTITION BY DAY WAL");
             execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 10), ('2024-01-01T01:00:00', 20)");
@@ -53,13 +61,15 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
             execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 30)");
             drainWalQueue();
 
-            // Stage day1 into the uploaded-while-native state on the physical writer.
+            // Stage day1 with a remote copy (REMOTE set) on the physical writer.
+            final long preAlterSeqTxn;
             try (TableWriter writer = getWriter("t")) {
                 TxWriter tx = writer.getTxWriter();
                 Assert.assertFalse(tx.isPartitionParquet(0));
-                Assert.assertTrue("day1 must be stamped before staging UPLOADED", tx.getNativePartitionSeqTxn(0) > 0);
-                tx.setPartitionParquetRemote(0, true);
-                Assert.assertTrue(tx.isPartitionParquetRemote(0));
+                preAlterSeqTxn = tx.getNativePartitionSeqTxn(0);
+                Assert.assertTrue("day1 must be stamped before staging REMOTE", preAlterSeqTxn > 0);
+                tx.setPartitionRemote(0, true);
+                Assert.assertTrue(tx.isPartitionRemote(0));
                 writer.bumpPartitionTableVersion();
                 writer.commit();
             }
@@ -69,10 +79,10 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
 
             try (TableReader reader = getReader("t")) {
                 TxReader tx = reader.getTxFile();
-                Assert.assertFalse("ALTER COLUMN TYPE must clear UPLOADED on the rewritten native partition",
-                        tx.isPartitionParquetRemote(0));
-                Assert.assertEquals("the slot resets to the unknown-version sentinel",
-                        -1L, tx.getNativePartitionSeqTxn(0));
+                Assert.assertFalse("ALTER COLUMN TYPE must clear REMOTE on the rewritten native partition",
+                        tx.isPartitionRemote(0));
+                Assert.assertTrue("the slot keeps a real version -- the ALTER's seqTxn -- not the -1 sentinel",
+                        tx.getNativePartitionSeqTxn(0) > preAlterSeqTxn);
                 Assert.assertFalse(tx.isPartitionParquet(0));
             }
 
@@ -83,6 +93,220 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                             "2024-01-01T00:00:00.000000Z\t10\n" +
                             "2024-01-01T01:00:00.000000Z\t20\n" +
                             "2024-01-02T00:00:00.000000Z\t30\n");
+        });
+    }
+
+    @Test
+    public void testChangeColumnTypeOnRemoteParquetPartitionClearsRemote() throws Exception {
+        // A parquet-format partition with REMOTE set is converted back to native by the
+        // changeColumnType pre-pass and then rewritten under the new column type. The rewrite is a
+        // data change: REMOTE and parquet_generated must clear and the ALTER's seqTxn must stamp
+        // a fresh version, so the partition's remote copy is invalidated instead of the stale remote parquet serving
+        // the old column layout.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x INT) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 10), ('2024-01-01T01:00:00', 20)");
+            drainWalQueue();
+            // day2 becomes the active partition, leaving day1 (index 0) non-active and convertible.
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 30)");
+            drainWalQueue();
+
+            execute("ALTER TABLE t CONVERT PARTITION TO PARQUET LIST '2024-01-01'");
+            drainWalQueue();
+
+            // Stage day1 with a remote copy (REMOTE set) on the physical writer.
+            try (TableWriter writer = getWriter("t")) {
+                TxWriter tx = writer.getTxWriter();
+                Assert.assertTrue("day1 must be parquet before the ALTER", tx.isPartitionParquet(0));
+                Assert.assertTrue("the slot holds the parquet file size before the ALTER",
+                        tx.getPartitionParquetFileSize(0) > 0);
+                tx.setPartitionRemote(0, true);
+                Assert.assertTrue(tx.isPartitionRemote(0));
+                writer.bumpPartitionTableVersion();
+                writer.commit();
+            }
+
+            execute("ALTER TABLE t ALTER COLUMN x TYPE LONG");
+            drainWalQueue();
+
+            try (TableReader reader = getReader("t")) {
+                TxReader tx = reader.getTxFile();
+                Assert.assertFalse("ALTER COLUMN TYPE converts the parquet partition back to native",
+                        tx.isPartitionParquet(0));
+                Assert.assertFalse("the column rewrite is a data change, the stale remote parquet no longer matches",
+                        tx.isPartitionRemote(0));
+                Assert.assertFalse("the rewrite invalidates the staged parquet flag",
+                        tx.isPartitionParquetGenerated(0));
+                Assert.assertTrue("the ALTER's seqTxn is stamped as a real version, not the -1 sentinel",
+                        tx.getNativePartitionSeqTxn(0) > 0);
+            }
+
+            // The rewritten column reads back its values (cast to LONG), not NULL.
+            assertQuery("SELECT * FROM t ORDER BY ts")
+                    .noLeakCheck().timestamp("ts").expectSize()
+                    .returns("ts\tx\n" +
+                            "2024-01-01T00:00:00.000000Z\t10\n" +
+                            "2024-01-01T01:00:00.000000Z\t20\n" +
+                            "2024-01-02T00:00:00.000000Z\t30\n");
+        });
+    }
+
+    @Test
+    public void testChangeColumnTypeRejectedOnReadOnlyPartition() throws Exception {
+        // ALTER COLUMN TYPE reopens every partition's column files, so a read-only partition (e.g.
+        // a remotely-served one) is rejected up front -- before any partition is converted -- with a clear
+        // message, not a cryptic fail-stop deeper on the missing local parquet.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x INT) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1), ('2024-01-02T00:00:00', 2)");
+
+            try (TableWriter writer = getWriter("t")) {
+                TxWriter tx = writer.getTxWriter();
+                tx.setPartitionReadOnlyByTimestamp(tx.getPartitionTimestampByIndex(0), true);
+                writer.bumpPartitionTableVersion();
+                writer.commit();
+            }
+
+            CairoException ex = Assert.assertThrows(
+                    CairoException.class,
+                    () -> execute("ALTER TABLE t ALTER COLUMN x TYPE LONG"));
+            TestUtils.assertContains(ex.getFlyweightMessage(), "cannot change column type, partition is read-only");
+
+            // the ALTER was rejected before any rewrite; the data still reads back unchanged
+            assertQuery("SELECT * FROM t ORDER BY ts")
+                    .timestamp("ts").expectSize()
+                    .returns("ts\tx\n" +
+                            "2024-01-01T00:00:00.000000Z\t1\n" +
+                            "2024-01-02T00:00:00.000000Z\t2\n");
+        });
+    }
+
+    @Test
+    public void testConvertParquetToNativePreservesRemoteClearsGenerated() throws Exception {
+        // CONVERT PARTITION TO NATIVE is a pure format transition: the rows do not change, so the
+        // remote copy still vouches for the partition and REMOTE must survive. The conversion does
+        // delete the local data.parquet, so parquet_generated must not outlive it, and the
+        // structural WAL apply stamps a real seqTxn.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            // separate commits so day1 is a stamped, non-active partition
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1)");
+            drainWalQueue();
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 2)");
+            drainWalQueue();
+
+            execute("ALTER TABLE t CONVERT PARTITION TO PARQUET LIST '2024-01-01'");
+            drainWalQueue();
+
+            // Stage day1 with a remote copy (REMOTE set) on the physical writer.
+            try (TableWriter writer = getWriter("t")) {
+                TxWriter tx = writer.getTxWriter();
+                Assert.assertTrue("day1 must be parquet before the convert", tx.isPartitionParquet(0));
+                tx.setPartitionRemote(0, true);
+                Assert.assertTrue(tx.isPartitionRemote(0));
+                writer.bumpPartitionTableVersion();
+                writer.commit();
+            }
+
+            execute("ALTER TABLE t CONVERT PARTITION TO NATIVE LIST '2024-01-01'");
+            drainWalQueue();
+
+            try (TableReader reader = getReader("t")) {
+                TxReader tx = reader.getTxFile();
+                Assert.assertFalse("day1 converted back to native", tx.isPartitionParquet(0));
+                Assert.assertTrue("a format transition does not change the rows, REMOTE must survive",
+                        tx.isPartitionRemote(0));
+                Assert.assertFalse("conversion deletes the local parquet, generated must not outlive it",
+                        tx.isPartitionParquetGenerated(0));
+                Assert.assertTrue("the structural WAL apply stamped a real seqTxn, not the -1 sentinel",
+                        tx.getNativePartitionSeqTxn(0) > 0);
+            }
+
+            assertQuery("SELECT * FROM t ORDER BY ts")
+                    .timestamp("ts").expectSize()
+                    .returns("ts\tx\n" +
+                            "2024-01-01T00:00:00.000000Z\t1\n" +
+                            "2024-01-02T00:00:00.000000Z\t2\n");
+        });
+    }
+
+    @Test
+    public void testConvertPartitionToNativeStampsStructuralSeqTxn() throws Exception {
+        // CONVERT PARTITION TO NATIVE is a structural WAL apply: walApplySeqTxn is unset, so the
+        // isWal() branch in convertPartitionParquetToNative stamps the op's getSeqTxn() rather than
+        // dropping offset 3 to the -1 sentinel. The round-tripped native partition keeps a real
+        // version instead of looking version-less.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            // separate commits so day1 is a stamped, non-active native partition
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1)");
+            drainWalQueue();
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 2)");
+            drainWalQueue();
+
+            try (TableReader reader = getReader("t")) {
+                TxReader tx = reader.getTxFile();
+                Assert.assertFalse("day1 is native before convert", tx.isPartitionParquet(0));
+                Assert.assertTrue("day1 native partition is stamped", tx.getNativePartitionSeqTxn(0) > 0);
+            }
+
+            execute("ALTER TABLE t CONVERT PARTITION TO PARQUET LIST '2024-01-01'");
+            drainWalQueue();
+
+            try (TableReader reader = getReader("t")) {
+                Assert.assertTrue("day1 converted to parquet", reader.getTxFile().isPartitionParquet(0));
+            }
+
+            execute("ALTER TABLE t CONVERT PARTITION TO NATIVE LIST '2024-01-01'");
+            drainWalQueue();
+
+            try (TableReader reader = getReader("t")) {
+                TxReader tx = reader.getTxFile();
+                Assert.assertFalse("day1 converted back to native", tx.isPartitionParquet(0));
+                Assert.assertTrue("the structural WAL apply stamped a real seqTxn, not the -1 sentinel",
+                        tx.getNativePartitionSeqTxn(0) > 0);
+                Assert.assertFalse("conversion deletes the local parquet, generated must not outlive it",
+                        tx.isPartitionParquetGenerated(0));
+                Assert.assertFalse("REMOTE was never set in this test, the round trip must not invent it",
+                        tx.isPartitionRemote(0));
+            }
+
+            assertQuery("SELECT * FROM t ORDER BY ts")
+                    .timestamp("ts").expectSize()
+                    .returns("ts\tx\n" +
+                            "2024-01-01T00:00:00.000000Z\t1\n" +
+                            "2024-01-02T00:00:00.000000Z\t2\n");
+        });
+    }
+
+    @Test
+    public void testConvertReadOnlyPartitionToNativeRejected() throws Exception {
+        // A read-only parquet partition (e.g. a remotely-served one) has no local data.parquet to decode back
+        // to native, so CONVERT PARTITION TO NATIVE rejects it on the read-only bit with a clear
+        // message. Marks a locally-present parquet partition read-only to isolate the read-only guard
+        // from the missing-file path.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1), ('2024-01-02T00:00:00', 2)");
+            execute("ALTER TABLE t CONVERT PARTITION TO PARQUET LIST '2024-01-01'");
+
+            try (TableWriter writer = getWriter("t")) {
+                TxWriter tx = writer.getTxWriter();
+                final long day1Ts = tx.getPartitionTimestampByIndex(0);
+                Assert.assertTrue("day1 must be parquet", tx.isPartitionParquet(0));
+                tx.setPartitionReadOnlyByTimestamp(day1Ts, true);
+                writer.bumpPartitionTableVersion();
+                writer.commit();
+
+                CairoException ex = Assert.assertThrows(
+                        CairoException.class,
+                        () -> writer.convertPartitionParquetToNative(day1Ts));
+                TestUtils.assertContains(ex.getFlyweightMessage(), "cannot convert read-only partition to native");
+
+                // the partition is untouched by the rejected convert: still parquet, still read-only
+                Assert.assertTrue("partition stays parquet", tx.isPartitionParquet(0));
+                Assert.assertTrue("read-only preserved", tx.isPartitionReadOnly(0));
+            }
         });
     }
 
@@ -110,6 +334,246 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                 // The slot now holds the parquet file size (KBs), not the small seqTxn.
                 Assert.assertTrue("slot now holds the parquet file size", tx.getPartitionParquetFileSize(0) > 0);
             }
+        });
+    }
+
+    @Test
+    public void testFailedToParquetSwitchKeepsNativeSeqTxn() throws Exception {
+        // switchNativePartitionWithParquet aborts with SWITCH_NO_PARQUET when data.parquet is
+        // missing. The partition stays native and its data is unchanged, so its stamped seqTxn must
+        // survive: the abort clears only parquet_generated, it must not blank offset 3 to the -1
+        // sentinel (that would throw away a still-valid version and make the partition look changed when it is not).
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x INT) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 10)");
+            drainWalQueue();
+            // day2 becomes the active partition, leaving day1 (index 0) non-active and stamped.
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 20)");
+            drainWalQueue();
+
+            try (TableWriter writer = getWriter("t")) {
+                TxWriter tx = writer.getTxWriter();
+                long partitionTs = tx.getPartitionTimestampByIndex(0);
+                Assert.assertFalse(tx.isPartitionParquet(0));
+                final long preSwitchSeqTxn = tx.getNativePartitionSeqTxn(0);
+                Assert.assertTrue("day1 must be stamped", preSwitchSeqTxn > 0);
+
+                // Flag the partition parquet-generated (keeping its seqTxn) without creating a
+                // data.parquet, so the switch reaches the "no parquet file to switch to" abort.
+                tx.setPartitionParquetGenerated(0, true);
+                writer.bumpPartitionTableVersion();
+                writer.commit();
+
+                Assert.assertEquals(TableWriter.SWITCH_NO_PARQUET,
+                        writer.switchNativePartitionWithParquet(partitionTs, 0L));
+
+                Assert.assertFalse("the aborted switch clears parquet_generated", tx.isPartitionParquetGenerated(0));
+                Assert.assertFalse("partition stays native", tx.isPartitionParquet(0));
+                Assert.assertEquals("the stamped seqTxn must survive the aborted switch",
+                        preSwitchSeqTxn, tx.getNativePartitionSeqTxn(0));
+            }
+        });
+    }
+
+    @Test
+    public void testMarkPartitionParquetReadyLegacyStampsSeqTxn() throws Exception {
+        // A legacy/unstamped WAL partition reads offset 3 as -1 (an old binary's word or a cleared
+        // slot). markPartitionParquetReady's "< 0 && isWal()" gate fires, stamping the current table
+        // seqTxn so the staged-parquet native partition gains a real version instead of staying -1.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1)");
+            drainWalQueue();
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 2)");
+            drainWalQueue();
+
+            final long day1Ts;
+            final long day1NameTxn;
+            final int tsType;
+            try (TableWriter writer = getWriter("t")) {
+                TxWriter tx = writer.getTxWriter();
+                Assert.assertFalse("day1 must be native", tx.isPartitionParquet(0));
+                // Roll day1 back to the cleared/unstamped sentinel to mimic a legacy partition.
+                tx.setPartitionSeqTxnByRawIndex(0, 0L);
+                Assert.assertEquals("legacy day1 reads as unstamped", -1L, tx.getNativePartitionSeqTxn(0));
+                day1Ts = tx.getPartitionTimestampByIndex(0);
+                day1NameTxn = tx.getPartitionNameTxn(0);
+                tsType = tx.getTimestampType();
+
+                plantEmptyDataParquet(day1Ts, day1NameTxn, tsType);
+                Assert.assertTrue(writer.markPartitionParquetReady(day1Ts, 4096L));
+
+                Assert.assertTrue("the legacy gate stamps the table seqTxn", tx.getNativePartitionSeqTxn(0) > 0);
+                Assert.assertTrue("partition is flagged parquet-generated", tx.isPartitionParquetGenerated(0));
+                Assert.assertFalse("partition stays native", tx.isPartitionParquet(0));
+            }
+        });
+    }
+
+    @Test
+    public void testMarkPartitionParquetReadyNonLegacyDoesNotBumpVersion() throws Exception {
+        // Non-legacy WAL partition already carries a stamped seqTxn (separate commits). Flagging it
+        // parquet-generated must NOT bump that version -- the "< 0" gate keeps the existing seqTxn,
+        // and the partition stays native, not remote.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            // separate commits so day1 is a stamped, non-active native partition
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1)");
+            drainWalQueue();
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 2)");
+            drainWalQueue();
+
+            final long day1Ts;
+            final long day1NameTxn;
+            final int tsType;
+            final long preSeqTxn;
+            try (TableWriter writer = getWriter("t")) {
+                TxWriter tx = writer.getTxWriter();
+                Assert.assertFalse("day1 must be native", tx.isPartitionParquet(0));
+                preSeqTxn = tx.getNativePartitionSeqTxn(0);
+                Assert.assertTrue("day1 is stamped", preSeqTxn > 0);
+                day1Ts = tx.getPartitionTimestampByIndex(0);
+                day1NameTxn = tx.getPartitionNameTxn(0);
+                tsType = tx.getTimestampType();
+
+                plantEmptyDataParquet(day1Ts, day1NameTxn, tsType);
+                Assert.assertTrue(writer.markPartitionParquetReady(day1Ts, 4096L));
+
+                Assert.assertTrue("partition is flagged parquet-generated", tx.isPartitionParquetGenerated(0));
+                Assert.assertEquals("a present version must not be bumped", preSeqTxn, tx.getNativePartitionSeqTxn(0));
+                Assert.assertFalse("partition stays native", tx.isPartitionParquet(0));
+                Assert.assertFalse("staging parquet does not mark the partition remote", tx.isPartitionRemote(0));
+            }
+        });
+    }
+
+    @Test
+    public void testMarkPartitionParquetReadyNonWalLeavesUnknownVersion() throws Exception {
+        // Non-WAL partition never carries a seqTxn (offset 3 stays -1). markPartitionParquetReady's
+        // "< 0 && isWal()" gate skips the stamp because there is no real version to write, yet still
+        // flags the partition parquet-generated and reads its native data unchanged.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1), ('2024-01-02T00:00:00', 2)");
+
+            final long day1Ts;
+            final long day1NameTxn;
+            final int tsType;
+            try (TableWriter writer = getWriter("t")) {
+                TxWriter tx = writer.getTxWriter();
+                Assert.assertFalse("day1 must be native", tx.isPartitionParquet(0));
+                Assert.assertEquals("non-WAL day1 has no version", -1L, tx.getNativePartitionSeqTxn(0));
+                day1Ts = tx.getPartitionTimestampByIndex(0);
+                day1NameTxn = tx.getPartitionNameTxn(0);
+                tsType = tx.getTimestampType();
+
+                plantEmptyDataParquet(day1Ts, day1NameTxn, tsType);
+                Assert.assertTrue(writer.markPartitionParquetReady(day1Ts, 4096L));
+
+                Assert.assertEquals("the isWal() gate skips the stamp on a non-WAL table",
+                        -1L, tx.getNativePartitionSeqTxn(0));
+                Assert.assertTrue("partition is flagged parquet-generated", tx.isPartitionParquetGenerated(0));
+                Assert.assertFalse("partition stays native", tx.isPartitionParquet(0));
+            }
+
+            // the native data still reads correctly; the empty staged parquet is ignored
+            assertQuery("SELECT * FROM t ORDER BY ts")
+                    .timestamp("ts").expectSize()
+                    .returns("ts\tx\n" +
+                            "2024-01-01T00:00:00.000000Z\t1\n" +
+                            "2024-01-02T00:00:00.000000Z\t2\n");
+        });
+    }
+
+    @Test
+    public void testNativePartitionWithStrayParquetMetadataReadsNativeOnDrop() throws Exception {
+        // A native-format partition can transiently carry a data.parquet/_pm next to its native columns
+        // (a staged/stray parquet sidecar), while its offset-3 word is a seqTxn, not a file size. A DROP of an
+        // adjacent partition recomputes this partition's min/max; the recompute must key on the format
+        // bit and read the NATIVE columns, not route through the parquet branch and feed the seqTxn to
+        // the footer reader (which asserts/throws). Plants a stray _pm to exercise the dispatch directly.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1), ('2024-01-01T06:00:00', 2)");
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 3)");
+            execute("INSERT INTO t VALUES ('2024-01-03T00:00:00', 4)");
+            drainWalQueue();
+
+            final long day1Ts;
+            final long day1NameTxn;
+            final int tsType;
+            try (TableReader reader = getReader("t")) {
+                TxReader tx = reader.getTxFile();
+                Assert.assertFalse("day1 must be native", tx.isPartitionParquet(0));
+                Assert.assertTrue("day1 must carry a stamped seqTxn", tx.getNativePartitionSeqTxn(0) > 0);
+                day1Ts = tx.getPartitionTimestampByIndex(0);
+                day1NameTxn = tx.getPartitionNameTxnByPartitionTimestamp(day1Ts, -1L);
+                tsType = tx.getTimestampType();
+            }
+
+            // Plant a stray _pm next to day1's native columns (mimics a staged/orphan parquet sidecar).
+            final FilesFacade ff = configuration.getFilesFacade();
+            try (Path p = new Path()) {
+                TableToken tt = engine.verifyTableName("t");
+                p.of(configuration.getDbRoot()).concat(tt);
+                TableUtils.setPathForNativePartition(p, tsType, PartitionBy.DAY, day1Ts, day1NameTxn);
+                p.concat(TableUtils.PARQUET_METADATA_FILE_NAME).$();
+                Assert.assertTrue("plant stray _pm", ff.touch(p.$()));
+            }
+
+            // DROP the middle partition (day2) recomputes day1's min/max via the prev-partition path.
+            execute("ALTER TABLE t DROP PARTITION LIST '2024-01-02'");
+            drainWalQueue();
+
+            // day1 (read from its native columns) and day3 survive with correct data; no throw.
+            assertQuery("SELECT * FROM t ORDER BY ts")
+                    .timestamp("ts").expectSize()
+                    .returns("ts\tx\n" +
+                            "2024-01-01T00:00:00.000000Z\t1\n" +
+                            "2024-01-01T06:00:00.000000Z\t2\n" +
+                            "2024-01-03T00:00:00.000000Z\t4\n");
+        });
+    }
+
+    @Test
+    public void testNonWalO3MutateClearsStaleVersionAndRemote() throws Exception {
+        // A non-WAL O3 write into a non-active partition rewrites its data, so a stale stamp and
+        // REMOTE must not survive: a non-WAL mutate has no real seqTxn to write, so the slot
+        // drops to the -1 no-version word and REMOTE + parquet_generated clear with it.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1), ('2024-01-02T00:00:00', 2)");
+
+            try (TableWriter writer = getWriter("t")) {
+                TxWriter tx = writer.getTxWriter();
+                Assert.assertFalse(tx.isPartitionParquet(0));
+                // a real stamp first; setPartitionSeqTxn itself clears REMOTE, so REMOTE goes on after
+                tx.setPartitionSeqTxn(0, 5L);
+                Assert.assertEquals(5L, tx.getNativePartitionSeqTxn(0));
+                tx.setPartitionRemote(0, true);
+                tx.setPartitionParquetGenerated(0, true);
+                writer.bumpPartitionTableVersion();
+                writer.commit();
+            }
+
+            // O3 write into day1 (behind the active day2) rewrites the non-active partition directly.
+            execute("INSERT INTO t VALUES ('2024-01-01T05:00:00', 99)");
+
+            try (TableReader reader = getReader("t")) {
+                TxReader tx = reader.getTxFile();
+                Assert.assertFalse("partition stays native", tx.isPartitionParquet(0));
+                Assert.assertEquals("non-WAL O3 clears the stale stamp to the no-version word",
+                        -1L, tx.getNativePartitionSeqTxn(0));
+                Assert.assertFalse("a write clears stale REMOTE", tx.isPartitionRemote(0));
+                Assert.assertFalse("a write invalidates stale staged parquet", tx.isPartitionParquetGenerated(0));
+            }
+
+            assertQuery("SELECT * FROM t ORDER BY ts")
+                    .timestamp("ts").expectSize()
+                    .returns("ts\tx\n" +
+                            "2024-01-01T00:00:00.000000Z\t1\n" +
+                            "2024-01-01T05:00:00.000000Z\t99\n" +
+                            "2024-01-02T00:00:00.000000Z\t2\n");
         });
     }
 
@@ -146,6 +610,61 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testUpdateRejectsParquetFormatPartition() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1), ('2024-01-02T00:00:00', 2)");
+            execute("ALTER TABLE t CONVERT PARTITION TO PARQUET LIST '2024-01-01'");
+
+            try (TableReader reader = getReader("t")) {
+                Assert.assertTrue(reader.getTxFile().isPartitionParquet(0));
+            }
+
+            CairoException ex = Assert.assertThrows(
+                    CairoException.class,
+                    () -> execute("UPDATE t SET x = 10 WHERE ts = '2024-01-01T00:00:00'")
+            );
+            TestUtils.assertContains(ex.getFlyweightMessage(), "cannot update parquet-format partition");
+        });
+    }
+
+    @Test
+    public void testUpdateOnNonWalNativePartitionClearsRemoteState() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1), ('2024-01-02T00:00:00', 2)");
+
+            try (TableWriter writer = getWriter("t")) {
+                TxWriter tx = writer.getTxWriter();
+                Assert.assertFalse(tx.isPartitionParquet(0));
+                // a real stamp first; setPartitionSeqTxn itself clears REMOTE, so REMOTE goes on after
+                tx.setPartitionSeqTxn(0, 5L);
+                Assert.assertEquals(5L, tx.getNativePartitionSeqTxn(0));
+                tx.setPartitionRemote(0, true);
+                tx.setPartitionParquetGenerated(0, true);
+                writer.bumpPartitionTableVersion();
+            }
+
+            execute("UPDATE t SET x = 11 WHERE ts = '2024-01-01T00:00:00'");
+
+            try (TableReader reader = getReader("t")) {
+                TxReader tx = reader.getTxFile();
+                Assert.assertFalse(tx.isPartitionParquet(0));
+                Assert.assertFalse("UPDATE must clear stale native REMOTE", tx.isPartitionRemote(0));
+                Assert.assertFalse("UPDATE must invalidate stale staged parquet", tx.isPartitionParquetGenerated(0));
+                Assert.assertEquals("non-WAL UPDATE clears the stale stamp to the no-version word",
+                        -1L, tx.getNativePartitionSeqTxn(0));
+            }
+
+            assertQuery("SELECT * FROM t ORDER BY ts")
+                    .timestamp("ts").expectSize()
+                    .returns("ts\tx\n" +
+                            "2024-01-01T00:00:00.000000Z\t11\n" +
+                            "2024-01-02T00:00:00.000000Z\t2\n");
+        });
+    }
+
+    @Test
     public void testWalAppendStampsActivePartitionSeqTxn() throws Exception {
         assertMemoryLeak(() -> {
             execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
@@ -158,10 +677,40 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                 TxReader tx = reader.getTxFile();
                 Assert.assertEquals(1, tx.getPartitionCount());
                 Assert.assertFalse(tx.isPartitionParquet(0));
-                Assert.assertFalse(tx.isPartitionParquetRemote(0));
+                Assert.assertFalse(tx.isPartitionRemote(0));
                 // every commit appends to the active partition and stamps it with the committed seqTxn
                 Assert.assertTrue(tx.getSeqTxn() > 0);
                 Assert.assertEquals(tx.getSeqTxn(), tx.getNativePartitionSeqTxn(0));
+            }
+        });
+    }
+
+    @Test
+    public void testWalUpdateNoRowsLeavesPartitionVersionBitsUnchanged() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1), ('2024-01-02T00:00:00', 2)");
+            drainWalQueue();
+
+            final long seqTxnBefore;
+            try (TableWriter writer = getWriter("t")) {
+                TxWriter tx = writer.getTxWriter();
+                seqTxnBefore = tx.getNativePartitionSeqTxn(0);
+                Assert.assertTrue(seqTxnBefore > 0);
+                tx.setPartitionRemote(0, true);
+                tx.setPartitionParquetGenerated(0, true);
+                writer.bumpPartitionTableVersion();
+            }
+
+            execute("UPDATE t SET x = x + 100 WHERE ts < '2020-01-01T00:00:00'");
+            drainWalQueue();
+
+            try (TableReader reader = getReader("t")) {
+                TxReader tx = reader.getTxFile();
+                Assert.assertTrue("the WAL seqTxn still advances for the applied no-op SQL", tx.getSeqTxn() > seqTxnBefore);
+                Assert.assertEquals("no touched rows means no partition restamp", seqTxnBefore, tx.getNativePartitionSeqTxn(0));
+                Assert.assertTrue("no touched rows means REMOTE stays as it was", tx.isPartitionRemote(0));
+                Assert.assertTrue("no touched rows means staged parquet stays as it was", tx.isPartitionParquetGenerated(0));
             }
         });
     }
@@ -184,7 +733,7 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                 Assert.assertEquals(3, tx.getPartitionCount());
                 day1SeqTxn = tx.getNativePartitionSeqTxn(0);
                 Assert.assertTrue(day1SeqTxn > 0);
-                Assert.assertFalse(tx.isPartitionParquetRemote(0));
+                Assert.assertFalse(tx.isPartitionRemote(0));
             }
 
             // O3 write into day1 (now far behind the active day3) rewrites it and advances its seqTxn
@@ -196,9 +745,67 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                 long newSeqTxn = tx.getSeqTxn();
                 Assert.assertTrue("O3 commit advanced the global seqTxn", newSeqTxn > day1SeqTxn);
                 Assert.assertEquals("day1 restamped to the O3 commit seqTxn", newSeqTxn, tx.getNativePartitionSeqTxn(0));
-                Assert.assertFalse("a write clears UPLOADED", tx.isPartitionParquetRemote(0));
+                Assert.assertFalse("a write clears REMOTE", tx.isPartitionRemote(0));
                 Assert.assertFalse(tx.isPartitionParquet(0));
             }
         });
+    }
+
+    @Test
+    public void testWalUpdateStampsTouchedNativePartitions() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t VALUES " +
+                    "('2024-01-01T00:00:00', 1), " +
+                    "('2024-01-02T00:00:00', 2), " +
+                    "('2024-01-03T00:00:00', 3)");
+            drainWalQueue();
+
+            try (TableWriter writer = getWriter("t")) {
+                TxWriter tx = writer.getTxWriter();
+                Assert.assertEquals(3, tx.getPartitionCount());
+                for (int i = 0; i < 2; i++) {
+                    Assert.assertFalse(tx.isPartitionParquet(i));
+                    tx.setPartitionRemote(i, true);
+                    tx.setPartitionParquetGenerated(i, true);
+                }
+                writer.bumpPartitionTableVersion();
+            }
+
+            execute("UPDATE t SET x = x + 100 WHERE ts < '2024-01-03T00:00:00'");
+            drainWalQueue();
+
+            try (TableReader reader = getReader("t")) {
+                TxReader tx = reader.getTxFile();
+                final long updateSeqTxn = tx.getSeqTxn();
+                for (int i = 0; i < 2; i++) {
+                    Assert.assertFalse(tx.isPartitionParquet(i));
+                    Assert.assertFalse("UPDATE must clear REMOTE on touched partition " + i, tx.isPartitionRemote(i));
+                    Assert.assertFalse("UPDATE must clear staged parquet on touched partition " + i, tx.isPartitionParquetGenerated(i));
+                    Assert.assertEquals("UPDATE must stamp touched partition " + i, updateSeqTxn, tx.getNativePartitionSeqTxn(i));
+                }
+                Assert.assertEquals("untouched day3 remains stamped to its own insert seqTxn", updateSeqTxn - 1, tx.getNativePartitionSeqTxn(2));
+            }
+
+            assertQuery("SELECT * FROM t ORDER BY ts")
+                    .timestamp("ts").expectSize()
+                    .returns("ts\tx\n" +
+                            "2024-01-01T00:00:00.000000Z\t101\n" +
+                            "2024-01-02T00:00:00.000000Z\t102\n" +
+                            "2024-01-03T00:00:00.000000Z\t3\n");
+        });
+    }
+
+    // Plants an empty data.parquet next to a native partition's columns; markPartitionParquetReady
+    // only checks the file exists, it never reads it.
+    private void plantEmptyDataParquet(long partitionTimestamp, long partitionNameTxn, int tsType) {
+        final FilesFacade ff = configuration.getFilesFacade();
+        try (Path p = new Path()) {
+            TableToken tt = engine.verifyTableName("t");
+            p.of(configuration.getDbRoot()).concat(tt);
+            TableUtils.setPathForNativePartition(p, tsType, PartitionBy.DAY, partitionTimestamp, partitionNameTxn);
+            p.concat(TableUtils.PARQUET_PARTITION_NAME).$();
+            Assert.assertTrue("plant empty data.parquet", ff.touch(p.$()));
+        }
     }
 }

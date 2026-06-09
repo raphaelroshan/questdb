@@ -1301,7 +1301,7 @@ public class Mig941Test extends AbstractCairoTest {
         try (Path path = new Path()) {
             path.of(configuration.getDbRoot()).concat(token).concat(TableUtils.TXN_FILE_NAME);
             try (TxWriter txWriter = new TxWriter(ff, configuration).ofRW(path.$(), ColumnType.TIMESTAMP, PartitionBy.DAY)) {
-                txWriter.setPartitionParquetFormat(partitionTs, newParquetFileSize);
+                txWriter.setPartitionParquet(partitionTs, newParquetFileSize);
                 txWriter.commit(new ObjList<>());
             }
         }
