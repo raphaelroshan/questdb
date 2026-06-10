@@ -81,7 +81,20 @@ pub fn decode_single_timestamp_value(
     // for the duration of this call.
     let alloc = unsafe { &*allocator }.clone();
     let mut bufs = ColumnChunkBuffers::new(alloc);
-    let col_data = &file_data[col_start..col_start + col_len];
+    // A stale or corrupt `_pm`/footer can record a byte range past the parquet
+    // mmap; surface it as Err rather than slice-panic out of the JNI boundary.
+    let col_data = col_start
+        .checked_add(col_len)
+        .and_then(|col_end| file_data.get(col_start..col_end))
+        .ok_or_else(|| {
+            fmt_err!(
+                InvalidType,
+                "column chunk range {}..{} exceeds file data length {}",
+                col_start,
+                col_start.saturating_add(col_len),
+                file_data.len()
+            )
+        })?;
     decode_column_chunk_with_params(
         &mut ctx,
         &mut bufs,
@@ -949,6 +962,66 @@ mod tests {
             0,
         );
         assert!(result.is_err(), "expected error for truncated column chunk");
+    }
+
+    #[test]
+    fn invalid_byte_range_returns_error() {
+        let buf = write_i64_parquet(5);
+        let tas = TestAllocatorState::new();
+        let allocator = tas.allocator();
+        let buf_len = buf.len() as u64;
+
+        let mut cursor = Cursor::new(&*buf);
+        let metadata = read_metadata_with_size(&mut cursor, buf_len).unwrap();
+        let schema_col = &metadata.schema_descr.columns()[0];
+        let desc = &schema_col.descriptor;
+        let prim = &desc.primitive_type;
+
+        let descriptor = super::reconstruct_descriptor(
+            2,
+            0,
+            desc.max_rep_level as u8,
+            desc.max_def_level as u8,
+            "ts",
+            prim.field_info.repetition,
+        );
+
+        let rg = &metadata.row_groups[0];
+        let chunk = &rg.columns()[0];
+        let (col_start, _) = chunk.byte_range();
+        let compression = chunk.compression();
+        let num_values = chunk.num_values();
+        let col_start = col_start as usize;
+        let alloc_ptr = &allocator as *const _;
+
+        // A stale or corrupt `_pm`/footer can claim a byte range past the
+        // parquet mmap, or one whose start+len overflows usize. Both must
+        // surface as Err, never slice-panic out of the JNI boundary.
+        for (start, len) in [
+            (col_start, buf.len()),  // start + len runs past end of file_data
+            (buf.len() + 1, 1),      // start alone is past end of file_data
+            (col_start, usize::MAX), // start + len overflows usize
+        ] {
+            let result = super::decode_single_timestamp_value(
+                alloc_ptr,
+                &buf,
+                start,
+                len,
+                compression,
+                descriptor.clone(),
+                num_values,
+                "ts",
+                0,
+                0,
+                5,
+            );
+            assert!(
+                result.is_err(),
+                "expected Err for out-of-bounds range start={} len={}",
+                start,
+                len,
+            );
+        }
     }
 
     #[test]
