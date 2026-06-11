@@ -404,45 +404,6 @@ public class CopyExportTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testCopyParquetEmptyTable() throws Exception {
-        assertMemoryLeak(() -> {
-            execute("create table all_types_empty (" +
-                    "bool_col boolean, " +
-                    "byte_col byte, " +
-                    "short_col short, " +
-                    "int_col int, " +
-                    "long_col long, " +
-                    "float_col float, " +
-                    "double_col double, " +
-                    "string_col string, " +
-                    "symbol_col symbol, " +
-                    "t_ns timestamp_ns, " +
-                    "d_array DOUBLE[], " +
-                    "ts timestamp" +
-                    ") timestamp(ts)");
-
-            CopyExportRunnable stmt = () ->
-                    runAndFetchCopyExportID("copy all_types_empty to 'all_types_empty' with format parquet", sqlExecutionContext);
-            CopyExportRunnable test = () ->
-                    assertEventually(() -> {
-                        assertQuery("SELECT export_path, num_exported_files, status FROM \"sys.copy_export_log\" LIMIT -1")
-                                .noLeakCheck()
-                                .expectSize()
-                                .returns("export_path\tnum_exported_files\tstatus\n" +
-                                        exportRoot + File.separator + "all_types_empty.parquet" + "\t1\tfinished\n");
-                        assertQuery("select * from read_parquet('" + exportRoot + File.separator + "all_types_empty" + ".parquet')")
-                                .noLeakCheck()
-                                .timestamp("ts")
-                                .returns("""
-                                        bool_col\tbyte_col\tshort_col\tint_col\tlong_col\tfloat_col\tdouble_col\tstring_col\tsymbol_col\tt_ns\td_array\tts
-                                        """);
-                    });
-
-            testCopyExport(stmt, test);
-        });
-    }
-
-    @Test
     public void testCopyParquetDesignatedTimestampAfterDropColumn() throws Exception {
         // Regression test for designated timestamp detection in the batch
         // parquet encoder (create_partition_descriptor in jni.rs).
@@ -530,6 +491,45 @@ public class CopyExportTest extends AbstractCairoTest {
                             .noLeakCheck()
                             .expectSize()
                             .returns("status\nfinished\n"));
+
+            testCopyExport(stmt, test);
+        });
+    }
+
+    @Test
+    public void testCopyParquetEmptyTable() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table all_types_empty (" +
+                    "bool_col boolean, " +
+                    "byte_col byte, " +
+                    "short_col short, " +
+                    "int_col int, " +
+                    "long_col long, " +
+                    "float_col float, " +
+                    "double_col double, " +
+                    "string_col string, " +
+                    "symbol_col symbol, " +
+                    "t_ns timestamp_ns, " +
+                    "d_array DOUBLE[], " +
+                    "ts timestamp" +
+                    ") timestamp(ts)");
+
+            CopyExportRunnable stmt = () ->
+                    runAndFetchCopyExportID("copy all_types_empty to 'all_types_empty' with format parquet", sqlExecutionContext);
+            CopyExportRunnable test = () ->
+                    assertEventually(() -> {
+                        assertQuery("SELECT export_path, num_exported_files, status FROM \"sys.copy_export_log\" LIMIT -1")
+                                .noLeakCheck()
+                                .expectSize()
+                                .returns("export_path\tnum_exported_files\tstatus\n" +
+                                        exportRoot + File.separator + "all_types_empty.parquet" + "\t1\tfinished\n");
+                        assertQuery("select * from read_parquet('" + exportRoot + File.separator + "all_types_empty" + ".parquet')")
+                                .noLeakCheck()
+                                .timestamp("ts")
+                                .returns("""
+                                        bool_col\tbyte_col\tshort_col\tint_col\tlong_col\tfloat_col\tdouble_col\tstring_col\tsymbol_col\tt_ns\td_array\tts
+                                        """);
+                    });
 
             testCopyExport(stmt, test);
         });
@@ -795,7 +795,7 @@ public class CopyExportTest extends AbstractCairoTest {
                         assertQuery("select path, diskSizeHuman from export_files()  order by path")
                                 .noLeakCheck()
                                 .returns("path\tdiskSizeHuman\n" +
-                                        "test_table" + File.separator + "2020-01-01.parquet\t501.0 B\n" +
+                                        "test_table" + File.separator + "2020-01-01.parquet\t513.0 B\n" +
                                         "test_table" + File.separator + "2020-01-02.parquet\t590.0 B\n");
                     });
             testCopyExport(stmt, test);
