@@ -340,6 +340,9 @@ public class TxnTest extends AbstractCairoTest {
                     try (MemoryCMARW dumpMem = Vm.getCMARWInstance()) {
                         dumpMem.smallFile(ff, dumpPath.$(), MemoryTag.MMAP_DEFAULT);
                         live.dumpTo(dumpMem);
+                        // dumpTo writes at absolute offsets without advancing the append pointer;
+                        // close(false) flushes without truncating the file to that (zero) pointer.
+                        dumpMem.close(false);
                     }
 
                     // dumpTo writes into the passed-in buffer; the live reader is untouched.
