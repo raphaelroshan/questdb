@@ -282,6 +282,13 @@ public class TxReader implements Closeable, Mutable {
      * Returns a native partition's last-modifying seqTxn from the offset-3 word
      * (bit 63 REMOTE masked off), or -1 when the version is unknown. Native-only:
      * for a parquet partition offset 3 holds the file size, read it via the parquet accessor.
+     * <p>
+     * Contract: this is a monotonic-safe version hint, NOT a deterministic identity. It is
+     * always {@code >=} the highest seqTxn that actually wrote the partition, and it strictly
+     * increases whenever the partition's bytes change. It is NOT identical across instances
+     * applying the same WAL: block grouping, WAL-lag carry, and partition squashing all
+     * over-approximate it upward (never below). Only compare it where an over-estimate is
+     * harmless.
      */
     public long getNativePartitionSeqTxn(int partitionIndex) {
         assert !isPartitionParquet(partitionIndex);

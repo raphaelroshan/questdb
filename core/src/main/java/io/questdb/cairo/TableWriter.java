@@ -387,6 +387,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
     private final FragileCode RECOVER_FROM_COLUMN_OPEN_FAILURE = this::recoverOpenColumnFailure;
     private UpdateOperatorImpl updateOperatorImpl;
     // seqTxn of the WAL apply in progress, stamped into native partitions; -1 when not applying.
+    // For a block apply this is the block's last seqTxn.
     private long walApplySeqTxn = -1;
     private long walRowsProcessed;
     private WalTxnDetails walTxnDetails;
@@ -903,6 +904,14 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
 
             if (ex.isWALTolerable()) {
                 // Mark the transaction as applied and ignore it.
+                // An ignored UPDATE discards a data change, so it logs critical; other
+                // command skips (e.g. partition manipulation no-ops) stay at info.
+                LogRecord log = operation.getCmdType() == TableWriterTask.CMD_UPDATE_TABLE ? LOG.critical() : LOG.info();
+                log.$("ignoring WAL transaction the writer cannot apply [table=").$(tableToken)
+                        .$(", seqTxn=").$(seqTxn)
+                        .$(", error=").$safe(ex.getFlyweightMessage())
+                        .I$();
+
                 commitSeqTxn(seqTxn);
                 return 0;
             } else {
@@ -4694,6 +4703,11 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                         asyncCmd.deserialize(cmd).abandon();
                     }
                 }
+            } catch (Throwable th) {
+                LOG.critical()
+                        .$("could not abandon orphaned async command [table=").$(tableToken)
+                        .$(", err=").$(th)
+                        .I$();
             } finally {
                 commandSubSeq.done(cursor);
             }
@@ -6343,7 +6357,17 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
         Misc.free(o3PartitionUpdateSink);
         Misc.free(slaveTxReader);
         if (commandSubSeq != null) {
-            cancelOrphanedCommands();
+            // Same invariant as the seal-purge wrap above: the drain calls virtual
+            // ENT-overridable methods, and a throw escaping here would skip every
+            // free below and the lock release.
+            try {
+                cancelOrphanedCommands();
+            } catch (Throwable th) {
+                LOG.critical()
+                        .$("orphaned command cancel failed on writer close [table=").$(tableToken)
+                        .$(", err=").$(th)
+                        .I$();
+            }
             Misc.free(commandQueue);
         }
         Misc.free(dedupColumnCommitAddresses);
@@ -8032,6 +8056,8 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             long o3TimestampLo,
             long o3TimestampHi
     ) {
+        // _pm seqTxn for an in-place parquet rewrite: the apply seqTxn (high-water off the data-apply path).
+        long partitionSeqTxn = walApplySeqTxn > 0 ? walApplySeqTxn : getSeqTxn();
         long cursor = messageBus.getO3PartitionPubSeq().next();
         if (cursor > -1) {
             O3PartitionTask task = messageBus.getO3PartitionQueue().get(cursor);
@@ -8050,7 +8076,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                     srcNameTxn,
                     last,
                     getTxn(),
-                    getSeqTxn(),
+                    partitionSeqTxn,
                     sortedTimestampsAddr,
                     this,
                     columnCounter,
@@ -8080,7 +8106,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                     srcNameTxn,
                     last,
                     getTxn(),
-                    getSeqTxn(),
+                    partitionSeqTxn,
                     sortedTimestampsAddr,
                     this,
                     columnCounter,
@@ -11005,6 +11031,11 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
 
     private long produceParquetFromNative(Path path, Path other, long partitionTimestamp, int partitionIndex, long partitionNameTxn, long parquetNameTxn, @Nullable CharSequence bloomFilterColumns, double bloomFilterFpp) {
         final long partitionRowCount = getPartitionSize(partitionIndex);
+        // _pm seqTxn: the partition's own offset-3 (stable across instances), high-water if unstamped.
+        long partitionSeqTxn = txWriter.getNativePartitionSeqTxn(partitionIndex);
+        if (partitionSeqTxn <= 0) {
+            partitionSeqTxn = txWriter.getSeqTxn();
+        }
         return TableUtils.produceParquetFromNative(
                 path,
                 other,
@@ -11022,7 +11053,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                 bloomFilterFpp,
                 parquetBloomFilterIndexes,
                 -1L,
-                txWriter.getSeqTxn()
+                partitionSeqTxn
         );
     }
 
@@ -13310,8 +13341,11 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                     targetPartitionNameTxn,
                     targetFrame.getRowCount()
             );
+            // Cold version of the merged partition: max of the merged sources' offset-3 seqTxns, not the high-water.
+            long squashedSeqTxn = Math.max(0, txWriter.getNativePartitionSeqTxn(targetPartitionIndex));
             for (int i = 0; i < squashCount; i++) {
                 long sourcePartition = txWriter.getPartitionTimestampByIndex(targetPartitionIndex + 1);
+                squashedSeqTxn = Math.max(squashedSeqTxn, txWriter.getNativePartitionSeqTxn(targetPartitionIndex + 1));
 
                 other.trimTo(pathSize);
                 long sourceNameTxn = txWriter.getPartitionNameTxnByPartitionTimestamp(sourcePartition);
@@ -13350,7 +13384,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             }
 
             txWriter.updatePartitionSizeByTimestamp(targetPartition, targetFrame.getRowCount());
-            txWriter.setPartitionSeqTxn(targetPartitionIndex, txWriter.getSeqTxn());
+            txWriter.setPartitionSeqTxn(targetPartitionIndex, squashedSeqTxn);
             if (!txWriter.incrementPartitionSquashCounter(targetPartitionIndex)) {
                 // The squash counter overflew its 16 bits
                 // To help back to detect partition changes we will save a file inside the partition with the current timestamp

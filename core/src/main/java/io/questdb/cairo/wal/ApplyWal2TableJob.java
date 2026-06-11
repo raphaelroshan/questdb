@@ -893,7 +893,13 @@ public class ApplyWal2TableJob extends AbstractQueueConsumerJob<WalTxnNotificati
             if (e.isTableDropped()) {
                 throw e;
             }
-            LogRecord log = !e.isWALTolerable() ? LOG.error() : LOG.info();
+            final LogRecord log;
+            if (!e.isWALTolerable()) {
+                log = LOG.error();
+            } else {
+                // a tolerated UPDATE skip discards a data change, so it logs critical
+                log = cmdType == CMD_UPDATE_TABLE ? LOG.critical() : LOG.info();
+            }
             log.$("error applying SQL to wal table [table=").$(tableWriter.getTableToken())
                     .$(", sql=").$(sql)
                     .$(", msg=").$safe(e.getFlyweightMessage())

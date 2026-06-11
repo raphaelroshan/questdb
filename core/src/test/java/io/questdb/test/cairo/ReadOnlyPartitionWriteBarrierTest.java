@@ -37,7 +37,9 @@ import org.junit.Test;
  * Asserts the read-only partition write-barrier invariant: once a
  * partition's {@code read_only} bit is set, every {@link TableWriter}
  * data-modification path (in-order INSERT, O3 INSERT, UPDATE) must
- * silently drop or hard-reject the write.
+ * silently drop or hard-reject the write. On WAL apply, the UPDATE
+ * rejection downgrades to a deterministic whole-transaction skip
+ * (WAL-tolerable) so the table never suspends over it.
  */
 public class ReadOnlyPartitionWriteBarrierTest extends AbstractCairoTest {
 
@@ -197,6 +199,109 @@ public class ReadOnlyPartitionWriteBarrierTest extends AbstractCairoTest {
                 Assert.assertTrue("read_only bit preserved",
                         writer.getTxWriter().isPartitionReadOnly(0));
             }
+        });
+    }
+
+    @Test
+    public void testWalUpdateHotRowsAppliesWithReadOnlyPartitionPresent() throws Exception {
+        // An UPDATE whose matched rows all live in writable partitions applies
+        // normally even when the table carries a read-only partition.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t_rw_wal_hot (x LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t_rw_wal_hot VALUES (1, '2020-01-01T00:00:00'), (2, '2020-01-03T00:00:00')");
+            drainWalQueue();
+            final TableToken tt = engine.verifyTableName("t_rw_wal_hot");
+            final long readOnlyTs = 1_577_836_800_000_000L; // 2020-01-01
+            try (TableWriter writer = getWriter(tt)) {
+                writer.getTxWriter().setPartitionReadOnlyByTimestamp(readOnlyTs, true);
+                writer.bumpPartitionTableVersion();
+                writer.commit();
+            }
+            final long ignoredBefore = engine.getMetrics().walMetrics().getApplyIgnoredTxnCount();
+
+            update("UPDATE t_rw_wal_hot SET x = 1002 WHERE ts IN '2020-01-03'");
+            drainWalQueue();
+
+            Assert.assertFalse("hot-rows-only UPDATE must apply, not suspend",
+                    engine.getTableSequencerAPI().isSuspended(tt));
+            Assert.assertEquals("hot-rows-only UPDATE must not count as ignored",
+                    ignoredBefore, engine.getMetrics().walMetrics().getApplyIgnoredTxnCount());
+            assertQuery("t_rw_wal_hot").noLeakCheck().timestamp("ts").expectSize().returns(
+                    "x\tts\n" +
+                            "1\t2020-01-01T00:00:00.000000Z\n" +
+                            "1002\t2020-01-03T00:00:00.000000Z\n");
+        });
+    }
+
+    @Test
+    public void testWalUpdateReadOnlyPartitionSkipsTransaction() throws Exception {
+        // A WAL-applied UPDATE matching rows in a read-only partition must not
+        // suspend the table: the read-only flag is sequenced state, so every
+        // instance skips the transaction identically. The seqTxn watermark
+        // advances and later transactions keep applying.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t_rw_wal_upd (x LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t_rw_wal_upd VALUES (1, '2020-01-01T00:00:00'), (2, '2020-01-03T00:00:00')");
+            drainWalQueue();
+            final TableToken tt = engine.verifyTableName("t_rw_wal_upd");
+            final long readOnlyTs = 1_577_836_800_000_000L; // 2020-01-01
+            try (TableWriter writer = getWriter(tt)) {
+                writer.getTxWriter().setPartitionReadOnlyByTimestamp(readOnlyTs, true);
+                writer.bumpPartitionTableVersion();
+                writer.commit();
+            }
+            final long ignoredBefore = engine.getMetrics().walMetrics().getApplyIgnoredTxnCount();
+
+            update("UPDATE t_rw_wal_upd SET x = 999 WHERE ts IN '2020-01-01'");
+            drainWalQueue();
+
+            Assert.assertFalse("UPDATE over a read-only partition must not suspend the table",
+                    engine.getTableSequencerAPI().isSuspended(tt));
+
+            // the skipped transaction must not block later ones
+            execute("INSERT INTO t_rw_wal_upd VALUES (3, '2020-01-04T00:00:00')");
+            drainWalQueue();
+            try (TableWriter writer = getWriter(tt)) {
+                Assert.assertEquals("seqTxn watermark must advance past the skipped txn",
+                        3, writer.getAppliedSeqTxn());
+            }
+            assertQuery("t_rw_wal_upd").noLeakCheck().timestamp("ts").expectSize().returns(
+                    "x\tts\n" +
+                            "1\t2020-01-01T00:00:00.000000Z\n" +
+                            "2\t2020-01-03T00:00:00.000000Z\n" +
+                            "3\t2020-01-04T00:00:00.000000Z\n");
+        });
+    }
+
+    @Test
+    public void testWalUpdateSpanningHotAndReadOnlyPartitionsSkipsWholeStatement() throws Exception {
+        // The read-only partition sits AFTER the hot one in scan order, so the
+        // row loop has already staged hot-partition updates when it trips the
+        // read-only check: the rollback must discard them - all-or-nothing.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t_rw_wal_span (x LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t_rw_wal_span VALUES (1, '2020-01-01T00:00:00'), (2, '2020-01-03T00:00:00')");
+            drainWalQueue();
+            final TableToken tt = engine.verifyTableName("t_rw_wal_span");
+            final long readOnlyTs = 1_578_009_600_000_000L; // 2020-01-03
+            try (TableWriter writer = getWriter(tt)) {
+                writer.getTxWriter().setPartitionReadOnlyByTimestamp(readOnlyTs, true);
+                writer.bumpPartitionTableVersion();
+                writer.commit();
+            }
+            final long ignoredBefore = engine.getMetrics().walMetrics().getApplyIgnoredTxnCount();
+
+            update("UPDATE t_rw_wal_span SET x = x + 1000");
+            drainWalQueue();
+
+            Assert.assertFalse("spanning UPDATE must not suspend the table",
+                    engine.getTableSequencerAPI().isSuspended(tt));
+            Assert.assertEquals("the voided UPDATE must count as an ignored txn",
+                    ignoredBefore + 1, engine.getMetrics().walMetrics().getApplyIgnoredTxnCount());
+            assertQuery("t_rw_wal_span").noLeakCheck().timestamp("ts").expectSize().returns(
+                    "x\tts\n" +
+                            "1\t2020-01-01T00:00:00.000000Z\n" +
+                            "2\t2020-01-03T00:00:00.000000Z\n");
         });
     }
 }

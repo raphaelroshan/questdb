@@ -40,8 +40,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * writer; a writer closed without draining it (e.g. a distressed teardown skips tick()) drops
  * whatever is queued. {@link AsyncWriterCommand#abandon()} gives a fire-and-forget producer a
  * cleanup signal so it can release external state (e.g. a single-flight slot) rather than leak it.
- * These tests pin that {@code doClose} notifies queued commands via {@code abandon()} and that a
- * command applied by {@code tick()} is never abandoned.
+ * These tests pin that {@code doClose} notifies queued commands via {@code abandon()}, that a
+ * command applied by {@code tick()} is never abandoned, and that a throwing {@code abandon()}
+ * neither escapes {@code close()} nor stops the drain.
  */
 public class AsyncWriterCommandAbandonTest extends AbstractCairoTest {
 
@@ -55,13 +56,36 @@ public class AsyncWriterCommandAbandonTest extends AbstractCairoTest {
             final AtomicInteger abandoned = new AtomicInteger();
             final AtomicInteger applied = new AtomicInteger();
             try (TableWriter writer = newOffPoolWriter("tbl")) {
-                writer.publishAsyncWriterCommand(new ProbeCommand(token, abandoned, applied));
+                writer.publishAsyncWriterCommand(new ProbeCommand(token, abandoned, applied, false));
                 // Queued, not yet drained.
                 Assert.assertEquals(0, abandoned.get());
                 Assert.assertEquals(0, applied.get());
             }
             Assert.assertEquals("abandon() must fire once for the orphaned queued command", 1, abandoned.get());
             Assert.assertEquals("a closed writer must never apply the orphaned command", 0, applied.get());
+        });
+    }
+
+    @Test
+    public void testThrowingAbandonNeitherEscapesCloseNorStopsDrain() throws Exception {
+        // abandon()/newInstance() are virtual; a throwing implementation inside doClose must not
+        // skip the writer's native frees or strand the table lock, and commands queued behind the
+        // throwing one must still see their abandon().
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE tbl (ts TIMESTAMP, x INT) TIMESTAMP(ts) PARTITION BY DAY");
+            final TableToken token = engine.verifyTableName("tbl");
+            final AtomicInteger abandoned = new AtomicInteger();
+            final AtomicInteger applied = new AtomicInteger();
+            try (TableWriter writer = newOffPoolWriter("tbl")) {
+                writer.publishAsyncWriterCommand(new ProbeCommand(token, abandoned, applied, true));
+                writer.publishAsyncWriterCommand(new ProbeCommand(token, abandoned, applied, false));
+            }
+            Assert.assertEquals("the drain must reach the command queued behind the throwing one", 2, abandoned.get());
+            Assert.assertEquals("a closed writer must never apply an orphaned command", 0, applied.get());
+            // a completed doClose released the table lock: the writer reopens
+            try (TableWriter writer = newOffPoolWriter("tbl")) {
+                Assert.assertNotNull(writer);
+            }
         });
     }
 
@@ -75,7 +99,7 @@ public class AsyncWriterCommandAbandonTest extends AbstractCairoTest {
             final AtomicInteger abandoned = new AtomicInteger();
             final AtomicInteger applied = new AtomicInteger();
             try (TableWriter writer = newOffPoolWriter("tbl")) {
-                writer.publishAsyncWriterCommand(new ProbeCommand(token, abandoned, applied));
+                writer.publishAsyncWriterCommand(new ProbeCommand(token, abandoned, applied, false));
                 writer.tick();
                 Assert.assertEquals("tick() applies the queued command", 1, applied.get());
                 Assert.assertEquals("an applied command is not abandoned", 0, abandoned.get());
@@ -87,24 +111,30 @@ public class AsyncWriterCommandAbandonTest extends AbstractCairoTest {
 
     /**
      * Minimal {@link AsyncWriterCommand} that round-trips through the task's stored producer
-     * reference (newInstance() defaults to null) and records whether it was applied or abandoned.
+     * reference (newInstance() defaults to null), records whether it was applied or abandoned,
+     * and optionally injects a throw from abandon().
      */
     private static final class ProbeCommand implements AsyncWriterCommand {
         private static final int PROBE_CMD_TYPE = 10_001;
         private final AtomicInteger abandoned;
         private final AtomicInteger applied;
         private final TableToken tableToken;
+        private final boolean throwOnAbandon;
         private long correlationId;
 
-        private ProbeCommand(TableToken tableToken, AtomicInteger abandoned, AtomicInteger applied) {
+        private ProbeCommand(TableToken tableToken, AtomicInteger abandoned, AtomicInteger applied, boolean throwOnAbandon) {
             this.tableToken = tableToken;
             this.abandoned = abandoned;
             this.applied = applied;
+            this.throwOnAbandon = throwOnAbandon;
         }
 
         @Override
         public void abandon() {
             abandoned.incrementAndGet();
+            if (throwOnAbandon) {
+                throw new UnsupportedOperationException("abandon failure injection");
+            }
         }
 
         @Override

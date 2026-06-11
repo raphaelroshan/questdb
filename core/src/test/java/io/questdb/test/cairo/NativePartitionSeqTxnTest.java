@@ -24,7 +24,9 @@
 
 package io.questdb.test.cairo;
 
+import io.questdb.PropertyKey;
 import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ParquetMetaFileReader;
 import io.questdb.cairo.PartitionBy;
 import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableToken;
@@ -41,8 +43,9 @@ import org.junit.Test;
 
 /**
  * The WAL apply stamps each native partition's last-modifying seqTxn into the _txn parquet-file-size
- * word (bit 63 REMOTE masked off), so every instance holds a deterministic per-partition version.
- * Converting a partition to parquet overwrites the slot with the file size.
+ * word (bit 63 REMOTE masked off): a monotonic-safe per-partition version (>= the seqTxn that last
+ * wrote it, strictly increasing on a write), not a cross-instance identity. Converting a partition
+ * to parquet overwrites the slot with the file size.
  */
 public class NativePartitionSeqTxnTest extends AbstractCairoTest {
 
@@ -338,6 +341,42 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testConvertToParquetStampsPartitionSeqTxnInPm() throws Exception {
+        // The _pm seqTxn the cold gate reads for a parquet partition is the partition's OWN offset-3
+        // at convert time, not the table high-water -- so two instances converting the same partition
+        // at different high-waters agree, and a re-upload is not provoked by an unrelated high-water.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1)");
+            drainWalQueue();
+
+            final long day1SeqTxn;
+            try (TableReader reader = getReader("t")) {
+                day1SeqTxn = reader.getTxFile().getNativePartitionSeqTxn(0);
+                Assert.assertTrue("day1 native partition is stamped", day1SeqTxn > 0);
+            }
+
+            // Climb the table high-water above day1's stamp via writes to a later partition.
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 2)");
+            drainWalQueue();
+            execute("INSERT INTO t VALUES ('2024-01-02T01:00:00', 3)");
+            drainWalQueue();
+            final long highWater;
+            try (TableReader reader = getReader("t")) {
+                highWater = reader.getTxFile().getSeqTxn();
+                Assert.assertTrue("high-water is now above day1's stamp", highWater > day1SeqTxn);
+            }
+
+            execute("ALTER TABLE t CONVERT PARTITION TO PARQUET LIST '2024-01-01'");
+            drainWalQueue();
+
+            final long pmSeqTxn = readPmSeqTxn("t", 0);
+            Assert.assertEquals("the _pm carries the partition's own seqTxn, not the convert-time high-water",
+                    day1SeqTxn, pmSeqTxn);
+        });
+    }
+
+    @Test
     public void testFailedToParquetSwitchKeepsNativeSeqTxn() throws Exception {
         // switchNativePartitionWithParquet aborts with SWITCH_NO_PARQUET when data.parquet is
         // missing. The partition stays native and its data is unchanged, so its stamped seqTxn must
@@ -578,6 +617,38 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testO3RewriteOfParquetPartitionAdvancesPmSeqTxn() throws Exception {
+        // An O3 write into a parquet-format partition rewrites it in place. The new _pm must carry a
+        // higher seqTxn than before, so the cold gate sees a newer version and re-uploads the changed
+        // bytes instead of skipping them as already-durable.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1), ('2024-01-01T02:00:00', 2)");
+            drainWalQueue();
+            // A later partition leaves 2024-01-01 non-active and convertible.
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 3)");
+            drainWalQueue();
+            execute("ALTER TABLE t CONVERT PARTITION TO PARQUET LIST '2024-01-01'");
+            drainWalQueue();
+
+            final long pmSeqTxnBefore = readPmSeqTxn("t", 0);
+            Assert.assertTrue("converted parquet partition carries a _pm seqTxn", pmSeqTxnBefore > 0);
+
+            // O3 write into the parquet partition -> in-place rewrite.
+            execute("INSERT INTO t VALUES ('2024-01-01T01:00:00', 99)");
+            drainWalQueue();
+            try (TableReader reader = getReader("t")) {
+                Assert.assertTrue("partition stays parquet after the in-place O3 rewrite",
+                        reader.getTxFile().isPartitionParquet(0));
+            }
+
+            final long pmSeqTxnAfter = readPmSeqTxn("t", 0);
+            Assert.assertTrue("the in-place O3 rewrite advances the _pm seqTxn (" + pmSeqTxnBefore
+                    + " -> " + pmSeqTxnAfter + ")", pmSeqTxnAfter > pmSeqTxnBefore);
+        });
+    }
+
+    @Test
     public void testShowPartitionsDoesNotLeakSeqTxnAsFileSize() throws Exception {
         // Reader regression: every native partition now carries a non-(-1) seqTxn in offset 3, but
         // table_partitions gates the parquet-file-size read on the format bit, so it must still show
@@ -606,6 +677,53 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                     .returns("ts\tx\n" +
                             "2024-01-01T00:00:00.000000Z\t1\n" +
                             "2024-01-02T00:00:00.000000Z\t2\n");
+        });
+    }
+
+    @Test
+    public void testSquashStampsMaxSourceSeqTxnNotHighWater() throws Exception {
+        // squashSplitPartitions stamps the merged partition with max(merged sources' seqTxn), not the
+        // table high-water. Build a split partition last written at seqTxn S, let the high-water climb
+        // past S (a later partition + the squash command), then squash: the merged partition keeps S,
+        // not the high-water -- otherwise a manager switch would spuriously re-upload unchanged bytes.
+        assertMemoryLeak(() -> {
+            node1.setProperty(PropertyKey.CAIRO_O3_PARTITION_SPLIT_MIN_SIZE, 4 << 10);
+            node1.setProperty(PropertyKey.CAIRO_O3_LAST_PARTITION_MAX_SPLITS, 2);
+
+            execute("CREATE TABLE x (ts TIMESTAMP, y LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO x SELECT timestamp_sequence('2020-02-04T00', 60*1000000L), x FROM long_sequence(1320)");
+            drainWalQueue();
+            // O3 write into the middle of 2020-02-04 splits it.
+            execute("INSERT INTO x SELECT timestamp_sequence('2020-02-04T20:01', 1000000L), x FROM long_sequence(200)");
+            drainWalQueue();
+
+            final long seqTxnAfterSplit;
+            try (TableReader reader = getReader("x")) {
+                TxReader tx = reader.getTxFile();
+                seqTxnAfterSplit = tx.getSeqTxn();
+                Assert.assertEquals("2020-02-04 must be split into two sub-partitions", 2, tx.getPartitionCount());
+                Assert.assertEquals("both sub-partitions share the floor",
+                        tx.getPartitionFloor(tx.getPartitionTimestampByIndex(0)),
+                        tx.getPartitionFloor(tx.getPartitionTimestampByIndex(1)));
+            }
+
+            // A later partition makes 2020-02-04 non-active, then squash forces the merge.
+            execute("INSERT INTO x VALUES ('2020-02-05T00:00:00', 1)");
+            drainWalQueue();
+            execute("ALTER TABLE x SQUASH PARTITIONS");
+            drainWalQueue();
+
+            try (TableReader reader = getReader("x")) {
+                TxReader tx = reader.getTxFile();
+                final long seqTxnAfterSquash = tx.getSeqTxn();
+                Assert.assertEquals("2020-02-04 merged back to one partition, plus 2020-02-05", 2, tx.getPartitionCount());
+                final long mergedSeqTxn = tx.getNativePartitionSeqTxn(0);
+                Assert.assertTrue("the squash advanced the high-water past the merged sources",
+                        seqTxnAfterSquash > seqTxnAfterSplit);
+                Assert.assertEquals("merged partition keeps max(sources) -- the last seqTxn that wrote it",
+                        seqTxnAfterSplit, mergedSeqTxn);
+                Assert.assertTrue("...not the table high-water at squash time", mergedSeqTxn < seqTxnAfterSquash);
+            }
         });
     }
 
@@ -794,6 +912,22 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                             "2024-01-02T00:00:00.000000Z\t102\n" +
                             "2024-01-03T00:00:00.000000Z\t3\n");
         });
+    }
+
+    // Reads the seqTxn stored in a parquet partition's _pm, keyed by its offset-3 file size --
+    // the same value the cold-upload gate compares against the manifest.
+    private long readPmSeqTxn(String table, int partitionIndex) {
+        try (TableReader reader = getReader(table)) {
+            TxReader tx = reader.getTxFile();
+            final long fileSize = tx.getPartitionParquetFileSize(partitionIndex);
+            final long partitionTs = tx.getPartitionTimestampByIndex(partitionIndex);
+            final long nameTxn = tx.getPartitionNameTxn(partitionIndex);
+            try (Path p = new Path()) {
+                p.of(configuration.getDbRoot()).concat(engine.verifyTableName(table));
+                TableUtils.setPathForParquetPartitionMetadata(p, tx.getTimestampType(), PartitionBy.DAY, partitionTs, nameTxn);
+                return new ParquetMetaFileReader().readSeqTxnForVersion(configuration.getFilesFacade(), p.$(), fileSize);
+            }
+        }
     }
 
     // Plants an empty data.parquet next to a native partition's columns; markPartitionParquetReady
