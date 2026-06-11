@@ -921,10 +921,6 @@ mod tests {
         Ok((parquet_buf, parquet_meta_bytes, parquet_meta_file_size))
     }
 
-    // -----------------------------------------------------------------------
-    // ColumnChunkSource::Buffers path
-    // -----------------------------------------------------------------------
-
     /// Slice the parquet file into one owned byte vector per requested column,
     /// using the chunks' byte_range_start/total_compressed recorded in `_pm`.
     /// Returns the owned buffers (kept alive by the caller) and a flat

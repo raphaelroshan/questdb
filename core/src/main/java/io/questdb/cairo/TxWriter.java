@@ -420,22 +420,6 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         }
     }
 
-    public void setPartitionFormat(long timestamp, boolean isParquetFormat, long version) {
-        int indexRaw = findAttachedPartitionRawIndex(timestamp);
-        if (indexRaw < 0) {
-            throw CairoException.nonCritical().put("bad partition index -1");
-        }
-        int offset = indexRaw + PARTITION_MASKED_SIZE_OFFSET;
-        long maskedSize = attachedPartitions.getQuick(offset);
-
-        maskedSize = updatePartitionHasParquetFormat(maskedSize, isParquetFormat);
-
-        attachedPartitions.setQuick(offset, maskedSize);
-
-        final long flags = getPartitionOffset3(indexRaw) & PARTITION_VERSION_FLAGS_MASK;
-        attachedPartitions.setQuick(indexRaw + PARTITION_VERSION_OFFSET, (version & PARTITION_VERSION_VALUE_MASK) | flags);
-    }
-
     public void setPartitionNative(long timestamp, long seqTxn) {
         setPartitionFormat(timestamp, false, seqTxn);
     }
@@ -792,6 +776,22 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
                 putLong(getPartitionTableIndexOffset(partitionTableOffset, i), attachedPartitions.getQuick(i));
             }
         }
+    }
+
+    private void setPartitionFormat(long timestamp, boolean isParquetFormat, long version) {
+        int indexRaw = findAttachedPartitionRawIndex(timestamp);
+        if (indexRaw < 0) {
+            throw CairoException.nonCritical().put("bad partition index -1");
+        }
+        int offset = indexRaw + PARTITION_MASKED_SIZE_OFFSET;
+        long maskedSize = attachedPartitions.getQuick(offset);
+
+        maskedSize = updatePartitionHasParquetFormat(maskedSize, isParquetFormat);
+
+        attachedPartitions.setQuick(offset, maskedSize);
+
+        final long flags = getPartitionOffset3(indexRaw) & PARTITION_VERSION_FLAGS_MASK;
+        attachedPartitions.setQuick(indexRaw + PARTITION_VERSION_OFFSET, (version & PARTITION_VERSION_VALUE_MASK) | flags);
     }
 
     private void setPartitionSquashCounterByRawIndex(int partitionRawIndex, short partitionSquashCounter) {

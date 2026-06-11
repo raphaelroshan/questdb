@@ -2600,7 +2600,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
         txWriter.bumpPartitionTableVersion();
     }
 
-    public boolean markPartitionParquetReady(long partitionTimestamp, long parquetFileSize) {
+    public boolean markPartitionParquetReady(long partitionTimestamp) {
         assert metadata.getTimestampIndex() > -1;
         assert PartitionBy.isPartitioned(partitionBy);
 

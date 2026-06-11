@@ -81,7 +81,8 @@ public class TxReader implements Closeable, Mutable {
     // +----------+----------+-------------------------------------------+
     // |  1 bit   |  7 bits  |                 56 bits                   |
     //
-    // remote clears by construction on any value write, so it can never outlive the bytes it vouches for.
+    // remote is cleared by the value writes that supersede the bytes (setPartitionParquetFileSize, setPartitionSeqTxn),
+    // so it can't outlive them; setPartitionFormat preserves it, leaving REMOTE to caller discipline on a format flip.
     // legacy: a cleared slot reads as 0L (written today) or -1L (older binaries), both folded by isPartitionOffset3Cleared().
     protected static final int PARTITION_TS_OFFSET = 0;
     protected static final int PARTITION_VERSION_OFFSET = 3;

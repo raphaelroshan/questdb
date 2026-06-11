@@ -441,7 +441,7 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                 tsType = tx.getTimestampType();
 
                 plantEmptyDataParquet(day1Ts, day1NameTxn, tsType);
-                Assert.assertTrue(writer.markPartitionParquetReady(day1Ts, 4096L));
+                Assert.assertTrue(writer.markPartitionParquetReady(day1Ts));
 
                 Assert.assertTrue("the legacy gate stamps the table seqTxn", tx.getNativePartitionSeqTxn(0) > 0);
                 Assert.assertTrue("partition is flagged parquet-generated", tx.isPartitionParquetGenerated(0));
@@ -477,7 +477,7 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                 tsType = tx.getTimestampType();
 
                 plantEmptyDataParquet(day1Ts, day1NameTxn, tsType);
-                Assert.assertTrue(writer.markPartitionParquetReady(day1Ts, 4096L));
+                Assert.assertTrue(writer.markPartitionParquetReady(day1Ts));
 
                 Assert.assertTrue("partition is flagged parquet-generated", tx.isPartitionParquetGenerated(0));
                 Assert.assertEquals("a present version must not be bumped", preSeqTxn, tx.getNativePartitionSeqTxn(0));
@@ -508,7 +508,7 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
                 tsType = tx.getTimestampType();
 
                 plantEmptyDataParquet(day1Ts, day1NameTxn, tsType);
-                Assert.assertTrue(writer.markPartitionParquetReady(day1Ts, 4096L));
+                Assert.assertTrue(writer.markPartitionParquetReady(day1Ts));
 
                 Assert.assertEquals("the isWal() gate skips the stamp on a non-WAL table",
                         -1L, tx.getNativePartitionSeqTxn(0));
