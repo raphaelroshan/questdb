@@ -268,6 +268,11 @@ public class WalEventCursor {
                 viewDefinitionInfo.read();
                 break;
             default:
+                // Only the reserved downstream range 64..127 is a valid unknown payload;
+                // any other unhandled byte is a corrupt record, not a custom event.
+                if (!WalTxnType.isDownstreamType(type)) {
+                    throw CairoException.critical(CairoException.METADATA_VALIDATION).put("Unsupported WAL event type: ").put(type);
+                }
                 unknownInfo.read();
                 break;
         }

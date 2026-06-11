@@ -28,13 +28,17 @@ import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.PartitionBy;
 import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.TableWriter;
 import io.questdb.cairo.wal.UnsupportedWalTxnTypeHandler;
 import io.questdb.cairo.wal.WalEventCursor;
 import io.questdb.cairo.wal.WalEventReader;
 import io.questdb.cairo.wal.WalTxnType;
+import io.questdb.cairo.wal.WalUtils;
 import io.questdb.cairo.wal.WalWriter;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
 import io.questdb.std.str.Path;
 import io.questdb.test.AbstractCairoTest;
@@ -227,6 +231,36 @@ public class WalCustomEventTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testReadRejectsUnknownTypeBelowDownstreamRange() throws Exception {
+        assertMemoryLeak(() -> {
+            TableToken tableToken = createTable("corrupt_event_type");
+            int walId;
+            try (WalWriter walWriter = engine.getWalWriter(tableToken)) {
+                walId = walWriter.getWalId();
+                walWriter.appendCustomEvent(CUSTOM_TYPE_LONG, mem -> mem.putLong(1L));
+            }
+
+            // Bytes 6..63 are neither a known OSS type (0..5) nor a reserved downstream
+            // type (64..127): a corrupt type byte in this gap must be a hard read error,
+            // not silently surfaced as an unknown/custom event.
+            for (byte corruptType : new byte[]{6, 32, 63}) {
+                corruptFirstRecordType(tableToken, walId, corruptType);
+                try (Path path = new Path();
+                     WalEventReader reader = new WalEventReader(configuration)) {
+                    segmentPath(path, tableToken, walId);
+                    CairoException ex = assertThrows(
+                            "type " + corruptType + " must be rejected",
+                            CairoException.class,
+                            () -> reader.of(path, 0)
+                    );
+                    assertEquals(CairoException.METADATA_VALIDATION, ex.getErrno());
+                    assertTrue(ex.getMessage(), ex.getMessage().contains("Unsupported WAL event type"));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testUnsupportedHandlerThrowsMetadataValidation() {
         try {
             UnsupportedWalTxnTypeHandler.INSTANCE.applyUnknownWalTxn((byte) 64, null, null, 0);
@@ -243,6 +277,26 @@ public class WalCustomEventTest extends AbstractCairoTest {
         row.append();
     }
 
+    private static void corruptFirstRecordType(TableToken tableToken, int walId, byte newType) {
+        final FilesFacade ff = configuration.getFilesFacade();
+        try (Path path = new Path()) {
+            segmentPath(path, tableToken, walId).concat(WalUtils.EVENT_FILE_NAME);
+            final long fd = TableUtils.openRW(ff, path.$(), LOG, configuration.getWriterFileOpenOpts());
+            try {
+                final long fileSize = ff.length(fd);
+                final long mem = TableUtils.mapRW(ff, fd, fileSize, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    // First record's type byte sits past the header and the per-record [len:int][txn:long] prefix.
+                    Unsafe.getUnsafe().putByte(mem + WalUtils.WALE_HEADER_SIZE + Integer.BYTES + Long.BYTES, newType);
+                } finally {
+                    ff.munmap(mem, fileSize, MemoryTag.NATIVE_DEFAULT);
+                }
+            } finally {
+                ff.close(fd);
+            }
+        }
+    }
+
     private static TableToken createTable(String name) {
         return createTable(new TableModel(configuration, name, PartitionBy.HOUR)
                 .col("a", ColumnType.BYTE)
@@ -250,8 +304,8 @@ public class WalCustomEventTest extends AbstractCairoTest {
                 .wal());
     }
 
-    private static void segmentPath(Path path, TableToken tableToken, int walId) {
-        path.of(configuration.getDbRoot())
+    private static Path segmentPath(Path path, TableToken tableToken, int walId) {
+        return path.of(configuration.getDbRoot())
                 .concat(tableToken)
                 .concat("wal").put(walId)
                 .slash().put(0);
