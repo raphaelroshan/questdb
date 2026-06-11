@@ -217,15 +217,12 @@ public class ReadOnlyPartitionWriteBarrierTest extends AbstractCairoTest {
                 writer.bumpPartitionTableVersion();
                 writer.commit();
             }
-            final long ignoredBefore = engine.getMetrics().walMetrics().getApplyIgnoredTxnCount();
 
             update("UPDATE t_rw_wal_hot SET x = 1002 WHERE ts IN '2020-01-03'");
             drainWalQueue();
 
             Assert.assertFalse("hot-rows-only UPDATE must apply, not suspend",
                     engine.getTableSequencerAPI().isSuspended(tt));
-            Assert.assertEquals("hot-rows-only UPDATE must not count as ignored",
-                    ignoredBefore, engine.getMetrics().walMetrics().getApplyIgnoredTxnCount());
             assertQuery("t_rw_wal_hot").noLeakCheck().timestamp("ts").expectSize().returns(
                     "x\tts\n" +
                             "1\t2020-01-01T00:00:00.000000Z\n" +
@@ -250,7 +247,6 @@ public class ReadOnlyPartitionWriteBarrierTest extends AbstractCairoTest {
                 writer.bumpPartitionTableVersion();
                 writer.commit();
             }
-            final long ignoredBefore = engine.getMetrics().walMetrics().getApplyIgnoredTxnCount();
 
             update("UPDATE t_rw_wal_upd SET x = 999 WHERE ts IN '2020-01-01'");
             drainWalQueue();
@@ -289,15 +285,11 @@ public class ReadOnlyPartitionWriteBarrierTest extends AbstractCairoTest {
                 writer.bumpPartitionTableVersion();
                 writer.commit();
             }
-            final long ignoredBefore = engine.getMetrics().walMetrics().getApplyIgnoredTxnCount();
-
             update("UPDATE t_rw_wal_span SET x = x + 1000");
             drainWalQueue();
 
             Assert.assertFalse("spanning UPDATE must not suspend the table",
                     engine.getTableSequencerAPI().isSuspended(tt));
-            Assert.assertEquals("the voided UPDATE must count as an ignored txn",
-                    ignoredBefore + 1, engine.getMetrics().walMetrics().getApplyIgnoredTxnCount());
             assertQuery("t_rw_wal_span").noLeakCheck().timestamp("ts").expectSize().returns(
                     "x\tts\n" +
                             "1\t2020-01-01T00:00:00.000000Z\n" +

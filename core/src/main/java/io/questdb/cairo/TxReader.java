@@ -179,8 +179,19 @@ public class TxReader implements Closeable, Mutable {
         final long partitionTableOffset = TableUtils.getPartitionTableSizeOffset(symbolMapCount);
         mem.putInt(baseOffset + partitionTableOffset, size * Long.BYTES);
         for (int i = 0; i < size; i++) {
+            long value = attachedPartitions.getQuick(i);
+            // A native partition's generated data.parquet only duplicates its native columns and is not
+            // part of a snapshot, so a checkpoint must not record the partition as parquet_generated --
+            // else the restored _txn claims a data.parquet that was never backed up. The masked-size
+            // word carries both the format and generated bits.
+            if (i % LONGS_PER_TX_ATTACHED_PARTITION == PARTITION_MASKED_SIZE_OFFSET) {
+                final int partitionIndex = i / LONGS_PER_TX_ATTACHED_PARTITION;
+                if (!isPartitionParquet(partitionIndex) && isPartitionParquetGenerated(partitionIndex)) {
+                    value &= ~(1L << PARTITION_MASK_PARQUET_GENERATED_BIT_OFFSET);
+                }
+            }
             long offset = TableUtils.getPartitionTableIndexOffset(partitionTableOffset, i);
-            mem.putLong(baseOffset + offset, attachedPartitions.getQuick(i));
+            mem.putLong(baseOffset + offset, value);
         }
     }
 

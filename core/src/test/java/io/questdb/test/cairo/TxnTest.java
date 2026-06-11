@@ -34,6 +34,7 @@ import io.questdb.cairo.TxReader;
 import io.questdb.cairo.TxWriter;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryCARW;
+import io.questdb.cairo.vm.api.MemoryCMARW;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.std.Files;
@@ -281,6 +282,83 @@ public class TxnTest extends AbstractCairoTest {
                     }
                 }
             });
+        });
+    }
+
+    @Test
+    public void testDumpToClearsParquetGeneratedForNativePartitionOnly() throws Exception {
+        // dumpTo is the _txn serializer for a backup/checkpoint snapshot (its only production caller is
+        // DatabaseCheckpointAgent). A native partition's generated data.parquet only duplicates the
+        // native columns and is omitted from a backup, so the snapshot must not claim it. This asserts
+        // dumpTo clears parquet_generated for a native partition, leaves a parquet-format partition (whose
+        // data.parquet IS backed up) alone, and -- critically -- never alters the live _txn.
+        TestUtils.assertMemoryLeak(() -> {
+            final FilesFacade ff = engine.getConfiguration().getFilesFacade();
+            final String tableName = "txnDumpParquetGenerated";
+            final TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY);
+            model.timestamp();
+            AbstractCairoTest.create(model);
+
+            try (Path path = new Path(); Path dumpPath = new Path()) {
+                final TableToken tableToken = engine.verifyTableName(tableName);
+                path.of(configuration.getDbRoot()).concat(tableToken).concat(TXN_FILE_NAME).$();
+                dumpPath.of(configuration.getDbRoot()).concat(tableToken).concat("_txn.backup").$();
+                final int tsType = TableUtils.getTimestampType(model);
+
+                // idx : state                       F  G  R  U   off-3   dumpTo clears G?
+                //  0  : native + generated          0  1  0  0   seqTxn  yes (upload-while-native)
+                //  1  : native + generated + sealed  0  1  1  1   seqTxn  yes (read-only/remote must not matter)
+                //  2  : parquet-local + generated    1  1  0  0   size    no  (its data.parquet is backed up)
+                //  3  : cold / remotely served       1  0  1  1   size    no  (already cleared)
+                //  4  : plain native                 0  0  0  0   seqTxn  no  (never had it)
+                try (TxWriter tw = new TxWriter(ff, configuration).ofRW(path.$(), tsType, PartitionBy.DAY)) {
+                    for (int i = 0; i < 5; i++) {
+                        tw.updatePartitionSizeByTimestamp(i * Micros.DAY_MICROS, i + 1);
+                    }
+                    tw.updateMaxTimestamp(5 * Micros.DAY_MICROS + 1);
+                    tw.finishPartitionSizeUpdate();
+                    applyVersionState(tw, 0, false, true, false, false, 101L);
+                    applyVersionState(tw, 1, false, true, true, true, 102L);
+                    applyVersionState(tw, 2, true, true, false, false, 4096L);
+                    applyVersionState(tw, 3, true, false, true, true, 8192L);
+                    applyVersionState(tw, 4, false, false, false, false, 105L);
+                    tw.commit(new ObjList<>());
+                }
+
+                try (TxReader live = new TxReader(ff)) {
+                    live.ofRO(path.$(), tsType, PartitionBy.DAY);
+                    live.unsafeLoadAll();
+
+                    // The live _txn (what a running table reads) keeps every flag: a commit never
+                    // touches parquet_generated.
+                    assertVersionState(live, 0, false, true, false, false, 101L);
+                    assertVersionState(live, 1, false, true, true, true, 102L);
+                    assertVersionState(live, 2, true, true, false, false, 4096L);
+                    assertVersionState(live, 3, true, false, true, true, 8192L);
+                    assertVersionState(live, 4, false, false, false, false, 105L);
+
+                    try (MemoryCMARW dumpMem = Vm.getCMARWInstance()) {
+                        dumpMem.smallFile(ff, dumpPath.$(), MemoryTag.MMAP_DEFAULT);
+                        live.dumpTo(dumpMem);
+                    }
+
+                    // dumpTo writes into the passed-in buffer; the live reader is untouched.
+                    assertVersionState(live, 0, false, true, false, false, 101L);
+                    assertVersionState(live, 1, false, true, true, true, 102L);
+                }
+
+                // The backup snapshot clears parquet_generated only for the native partitions (0, 1),
+                // independent of read-only/remote, and leaves every other flag and offset-3 value intact.
+                try (TxReader backup = new TxReader(ff)) {
+                    backup.ofRO(dumpPath.$(), tsType, PartitionBy.DAY);
+                    backup.unsafeLoadAll();
+                    assertVersionState(backup, 0, false, false, false, false, 101L);
+                    assertVersionState(backup, 1, false, false, true, true, 102L);
+                    assertVersionState(backup, 2, true, true, false, false, 4096L);
+                    assertVersionState(backup, 3, true, false, true, true, 8192L);
+                    assertVersionState(backup, 4, false, false, false, false, 105L);
+                }
+            }
         });
     }
 
