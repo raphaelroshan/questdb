@@ -710,8 +710,10 @@ public class ShowPartitionsTest extends AbstractCairoTest {
             }
 
             // Converting the oldest partition to parquet moves its seqTxn into the _pm footer.
-            // WAL stamps the footer with the conversion commit's seqTxn (the 3rd commit here:
-            // CTAS, O3 insert, convert); a non-WAL table has no WAL seqTxn, so the footer records 0.
+            // The footer carries the partition's own data seqTxn (the O3 insert's commit, 2),
+            // not the conversion commit's: conversion rewrites the storage format, not the data,
+            // so the stamp stays at the last write the parquet contains. A non-WAL table has no
+            // WAL seqTxn, so the footer records 0.
             execute("ALTER TABLE " + tableName + " CONVERT PARTITION TO PARQUET LIST '2023-01-01'");
             if (isWal) {
                 drainWalQueue();
@@ -722,7 +724,7 @@ public class ShowPartitionsTest extends AbstractCairoTest {
                     .noLeakCheck()
                     .noRandomAccess()
                     .sizeMayVary()
-                    .returns("name\tisParquet\tseqTxn\n2023-01-01\ttrue\t" + (isWal ? 3 : 0) + "\n");
+                    .returns("name\tisParquet\tseqTxn\n2023-01-01\ttrue\t" + (isWal ? 2 : 0) + "\n");
         });
     }
 
