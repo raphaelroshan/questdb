@@ -35,6 +35,7 @@ import io.questdb.cairo.TableWriter;
 import io.questdb.cairo.TxReader;
 import io.questdb.cairo.TxWriter;
 import io.questdb.std.FilesFacade;
+import io.questdb.std.MemoryTag;
 import io.questdb.std.str.Path;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.tools.TestUtils;
@@ -649,6 +650,84 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testReResolveRebindsSeqTxnToSelectedFooter() throws Exception {
+        // One reader instance re-resolved across a real two-footer MVCC chain must serve each
+        // selected footer's seqTxn: the cached native reader is bound to the resolved snapshot,
+        // and a re-resolve that picks a different footer rebinds it instead of serving the old
+        // parse. Small row groups + the ratio/max-bytes overrides make the O3 write an
+        // incremental _pm append (one row group replaced, footer appended), so the old snapshot
+        // stays reachable through the chain walk.
+        node1.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_ROW_GROUP_SIZE, 4);
+        node1.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_O3_REWRITE_UNUSED_RATIO, "1.0");
+        node1.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_O3_REWRITE_UNUSED_MAX_BYTES, Long.MAX_VALUE);
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, x LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("""
+                    INSERT INTO t VALUES
+                    ('2024-01-01T00:00:00', 1), ('2024-01-01T01:00:00', 2),
+                    ('2024-01-01T02:00:00', 3), ('2024-01-01T03:00:00', 4),
+                    ('2024-01-01T04:00:00', 5), ('2024-01-01T05:00:00', 6),
+                    ('2024-01-01T06:00:00', 7), ('2024-01-01T07:00:00', 8),
+                    ('2024-01-01T08:00:00', 9), ('2024-01-01T09:00:00', 10),
+                    ('2024-01-01T10:00:00', 11), ('2024-01-01T11:00:00', 12)
+                    """);
+            drainWalQueue();
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 99)");
+            drainWalQueue();
+            execute("ALTER TABLE t CONVERT PARTITION TO PARQUET LIST '2024-01-01'");
+            drainWalQueue();
+
+            final long oldParquetSize;
+            try (TableReader reader = getReader("t")) {
+                oldParquetSize = reader.getTxFile().getPartitionParquetFileSize(0);
+            }
+            final long oldSeqTxn = readPmSeqTxn("t", 0);
+            Assert.assertTrue("converted partition carries a _pm seqTxn", oldSeqTxn > 0);
+
+            // O3 write into one row group's interior -> incremental update appends a footer.
+            execute("INSERT INTO t VALUES ('2024-01-01T04:30:00', 100)");
+            drainWalQueue();
+
+            final long newParquetSize;
+            final long partitionTs;
+            final long nameTxn;
+            final int timestampType;
+            try (TableReader reader = getReader("t")) {
+                TxReader tx = reader.getTxFile();
+                Assert.assertTrue(tx.isPartitionParquet(0));
+                newParquetSize = tx.getPartitionParquetFileSize(0);
+                partitionTs = tx.getPartitionTimestampByIndex(0);
+                nameTxn = tx.getPartitionNameTxn(0);
+                timestampType = tx.getTimestampType();
+            }
+            final long newSeqTxn = readPmSeqTxn("t", 0);
+            Assert.assertTrue("the rewrite advances the seqTxn", newSeqTxn > oldSeqTxn);
+            Assert.assertNotEquals("the rewrite changes the parquet file size", oldParquetSize, newParquetSize);
+
+            final FilesFacade ff = configuration.getFilesFacade();
+            final ParquetMetaFileReader pmReader = new ParquetMetaFileReader();
+            try (Path p = new Path()) {
+                p.of(configuration.getDbRoot()).concat(engine.verifyTableName("t"));
+                TableUtils.setPathForParquetPartitionMetadata(p, timestampType, PartitionBy.DAY, partitionTs, nameTxn);
+                final long addr = ParquetMetaFileReader.openAndMapRO(ff, p.$(), pmReader);
+                Assert.assertTrue("post-rewrite _pm must open", addr != 0);
+                final long size = pmReader.getFileSize();
+                try {
+                    Assert.assertTrue(pmReader.resolveFooter(oldParquetSize));
+                    Assert.assertEquals("older version's footer seqTxn", oldSeqTxn, pmReader.getResolvedSeqTxn());
+                    Assert.assertTrue(pmReader.resolveFooter(newParquetSize));
+                    Assert.assertEquals("re-resolve to the latest footer rebinds", newSeqTxn, pmReader.getResolvedSeqTxn());
+                    Assert.assertTrue(pmReader.resolveFooter(oldParquetSize));
+                    Assert.assertEquals("and back to the older footer", oldSeqTxn, pmReader.getResolvedSeqTxn());
+                } finally {
+                    pmReader.clear();
+                    ff.munmap(addr, size, MemoryTag.MMAP_PARQUET_METADATA_READER);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testShowPartitionsDoesNotLeakSeqTxnAsFileSize() throws Exception {
         // Reader regression: every native partition now carries a non-(-1) seqTxn in offset 3, but
         // table_partitions gates the parquet-file-size read on the format bit, so it must still show
@@ -925,7 +1004,7 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
             try (Path p = new Path()) {
                 p.of(configuration.getDbRoot()).concat(engine.verifyTableName(table));
                 TableUtils.setPathForParquetPartitionMetadata(p, tx.getTimestampType(), PartitionBy.DAY, partitionTs, nameTxn);
-                return new ParquetMetaFileReader().readSeqTxnForVersion(configuration.getFilesFacade(), p.$(), fileSize);
+                return TestUtils.readSeqTxnForVersion(configuration.getFilesFacade(), p.$(), fileSize);
             }
         }
     }

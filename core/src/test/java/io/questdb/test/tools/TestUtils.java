@@ -2007,6 +2007,37 @@ public final class TestUtils {
         }
     }
 
+    /**
+     * Reads the {@code seqTxn} stamped into the footer of the {@code _pm}
+     * snapshot identified by {@code parquetFileSize} (the MVCC version token
+     * from {@code _txn} field 3), opening and mapping the file for the
+     * duration of the call. Returns {@code -1} when the file is missing or
+     * unreadable, when no footer in the chain matches {@code parquetFileSize},
+     * or when the matched footer carries no {@code seqTxn}.
+     */
+    public static long readSeqTxnForVersion(FilesFacade ff, LPSZ path, long parquetFileSize) {
+        final ParquetMetaFileReader reader = new ParquetMetaFileReader();
+        long addr = 0;
+        long size = 0;
+        try {
+            addr = ParquetMetaFileReader.openAndMapRO(ff, path, reader);
+            if (addr == 0) {
+                return -1;
+            }
+            // Capture the mapping size before clear() zeros it; needed for munmap.
+            size = reader.getFileSize();
+            if (!reader.resolveFooter(parquetFileSize)) {
+                return -1;
+            }
+            return reader.getResolvedSeqTxn();
+        } finally {
+            reader.clear();
+            if (addr != 0) {
+                ff.munmap(addr, size, MemoryTag.MMAP_PARQUET_METADATA_READER);
+            }
+        }
+    }
+
     public static boolean remove(LPSZ lpsz) {
         if (Files.remove(lpsz)) {
             return true;
@@ -2451,7 +2482,7 @@ public final class TestUtils {
                     // _txn field 3 holds the parquet file size; the seqTxn is in the _pm footer.
                     path.trimTo(rootLen);
                     TableUtils.setPathForNativePartition(path, timestampType, partitionBy, timestamp, txReader.getPartitionNameTxn(i));
-                    seqTxn = new ParquetMetaFileReader().readSeqTxnForVersion(
+                    seqTxn = readSeqTxnForVersion(
                             ff,
                             path.concat(TableUtils.PARQUET_METADATA_FILE_NAME).$(),
                             txReader.getPartitionParquetFileSize(i)

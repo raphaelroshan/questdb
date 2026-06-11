@@ -34,7 +34,6 @@ import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.TableUtils;
 import io.questdb.std.MemoryTag;
-import io.questdb.std.Unsafe;
 import io.questdb.griffin.engine.table.ParquetRowGroupFilter;
 import io.questdb.std.Files;
 import io.questdb.std.FilesFacade;
@@ -1401,17 +1400,10 @@ public class AlterTableConvertPartitionTest extends AbstractCairoTest {
                 Assert.assertTrue("openAndMapRO should succeed", addr > 0);
                 try {
                     Assert.assertTrue(reader.resolveFooter(Long.MAX_VALUE));
-
-                    final long buf = Unsafe.malloc(24, MemoryTag.NATIVE_DEFAULT);
-                    try {
-                        reader.readPartitionMeta(buf);
-                        Assert.assertEquals(
-                                "seqTxn in _pm must match TableWriter.getSeqTxn()",
-                                expectedSeqTxn, Unsafe.getLong(buf + 16)
-                        );
-                    } finally {
-                        Unsafe.free(buf, 24, MemoryTag.NATIVE_DEFAULT);
-                    }
+                    Assert.assertEquals(
+                            "seqTxn in _pm must match TableWriter.getSeqTxn()",
+                            expectedSeqTxn, reader.getResolvedSeqTxn()
+                    );
                 } finally {
                     ff.munmap(addr, reader.getFileSize(), MemoryTag.MMAP_PARQUET_METADATA_READER);
                     reader.clear();

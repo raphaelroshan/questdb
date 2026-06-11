@@ -40,10 +40,12 @@ import org.jetbrains.annotations.TestOnly;
  * File reader for the _pm files, which are sidecar files for the `.parquet` format.
  * <p>
  * Implements {@link ParquetRowGroupSkipper} for filter-pushdown row group
- * pruning. The first call to {@link #canSkipRowGroup} lazily allocates a
- * native handle that caches the parsed {@code _pm} header/footer; the
- * handle is reused across all subsequent skip calls and freed by
- * {@link #clear()}.
+ * pruning. The first native read ({@link #canSkipRowGroup},
+ * {@link #getResolvedSeqTxn}, {@link #readPartitionMeta}, row-group decode
+ * via {@link #getOrCreateNativeReaderPtr}) lazily allocates a native handle
+ * that caches the {@code _pm} header and the resolved footer in parsed
+ * form; the handle is reused across all subsequent native calls and freed
+ * by {@link #clear()}.
  * <p>
  * <b>Ownership:</b> The reader does NOT own the underlying {@code _pm} mmap.
  * The caller mmaps the file (typically via {@link #openAndMapRO(FilesFacade, LPSZ, ParquetMetaFileReader)}
@@ -158,14 +160,20 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
     private final DirectUtf8String flyweightColName = new DirectUtf8String();
     private long addr;
     // CRC32 verification result for the currently bound _pm mapping. Set
-    // true after a successful verifyChecksum0 call so subsequent opens
-    // (resolveFooter and onward) skip re-verification. Reset by clear().
+    // true after the verified parse on the first resolveFooter so
+    // subsequent resolves skip re-verification. Reset by clear().
     private boolean checksumVerified;
     private int columnCount;
     private long fileSize;
     private long footerAddr;
-    // Lazily allocated native handle to a JniParquetMetaReader. Created on
-    // the first canSkipRowGroup call and freed by clear().
+    // Committed _pm snapshot size the native handle was parsed at.
+    // Meaningful only while nativeReaderPtr != 0.
+    private long nativeReaderFileSize;
+    // Native handle to a JniParquetMetaReader bound to one _pm snapshot.
+    // Created by the verified parse on the first resolveFooter (latest
+    // snapshot) or lazily by getOrCreateNativeReaderPtr (resolved
+    // snapshot); invalidated when a resolve selects a different snapshot;
+    // freed by clear().
     private long nativeReaderPtr;
     // Committed _pm size of the MVCC snapshot whose footer resolveFooter
     // settled on. Equals fileSize when the latest footer is selected, and a
@@ -298,13 +306,9 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
 
     @Override
     public boolean canSkipRowGroup(int rowGroupIndex, DirectLongList filters, long filterBufEnd) {
-        assert addr != 0;
         assert filters.size() % ParquetRowGroupFilter.LONGS_PER_FILTER == 0;
-        if (nativeReaderPtr == 0) {
-            nativeReaderPtr = createNativeReader(addr, fileSize);
-        }
         return canSkipRowGroup0(
-                nativeReaderPtr,
+                getOrCreateNativeReaderPtr(),
                 rowGroupIndex,
                 filters.getAddress(),
                 (int) (filters.size() / ParquetRowGroupFilter.LONGS_PER_FILTER),
@@ -317,6 +321,7 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
             destroyNativeReader(nativeReaderPtr);
             nativeReaderPtr = 0;
         }
+        this.nativeReaderFileSize = 0;
         this.addr = 0;
         this.fileSize = 0;
         this.footerAddr = 0;
@@ -405,14 +410,20 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
     }
 
     /**
-     * Returns the native reader handle, allocating it lazily on first call.
+     * Returns the native reader handle, allocating it lazily when the
+     * verified parse from {@link #resolveFooter(long)} was not retained.
      * The handle caches the parsed {@code _pm} header / footer / feature-flag
-     * layout so repeated JNI calls (filter pruning AND row-group decode) avoid
-     * reparsing. Freed by {@link #clear()}.
+     * layout so repeated JNI calls (filter pruning, row-group decode, footer
+     * field reads) avoid reparsing. It is bound to the snapshot the preceding
+     * {@link #resolveFooter(long)} settled on — the native and Java sides
+     * always describe the same footer — and a re-resolve that selects a
+     * different snapshot invalidates it. Freed by {@link #clear()}.
      */
     public long getOrCreateNativeReaderPtr() {
+        assert isOpen();
         if (nativeReaderPtr == 0) {
-            nativeReaderPtr = createNativeReader(addr, fileSize);
+            nativeReaderPtr = createNativeReader(addr, resolvedFileSize, false);
+            nativeReaderFileSize = resolvedFileSize;
         }
         return nativeReaderPtr;
     }
@@ -443,18 +454,12 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
 
     /**
      * Reads the seqTxn from the currently resolved footer (the snapshot selected by the
-     * preceding resolveFooter call), reusing the open mapping. Returns -1 when that footer
-     * carries no seqTxn. Caller must hold an open, resolved reader (isOpen()).
+     * preceding resolveFooter call), a field read off the cached native reader. Returns
+     * -1 when that footer carries no seqTxn. Caller must hold an open, resolved reader
+     * (isOpen()).
      */
     public long getResolvedSeqTxn() {
-        assert addr != 0;
-        final long buf = Unsafe.malloc(24, MemoryTag.NATIVE_DEFAULT);
-        try {
-            readPartitionMeta0(addr, resolvedFileSize, buf);
-            return Unsafe.getLong(buf + 16); // seqTxn is the 3rd long of the 24-byte buffer
-        } finally {
-            Unsafe.free(buf, 24, MemoryTag.NATIVE_DEFAULT);
-        }
+        return readSeqTxn0(getOrCreateNativeReaderPtr());
     }
 
     public int getRowGroupCount() {
@@ -620,70 +625,17 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
     }
 
     /**
-     * Writes three longs into a 24-byte buffer at {@code destAddr}:
-     * row count, partition squash tracker, and latest-footer
-     * {@code seqTxn}. Squash tracker and {@code seqTxn} are {@code -1}
-     * when their respective feature bits are absent. Enterprise callers
-     * use this to retrieve all three values in one JNI round trip.
+     * Writes two longs into a 16-byte buffer at {@code destAddr}: the
+     * resolved footer's row count and the partition squash tracker. The
+     * squash tracker is {@code -1} when its feature bit is absent.
+     * Enterprise callers use this to retrieve both values in one JNI round
+     * trip. Caller must hold an open, resolved reader (isOpen()).
      *
-     * @param destAddr address of a 24-byte buffer to receive the three longs
+     * @param destAddr address of a 16-byte buffer to receive the two longs
      * @throws CairoException on malformed {@code _pm} data
      */
     public void readPartitionMeta(long destAddr) {
-        assert addr != 0;
-        readPartitionMeta0(addr, fileSize, destAddr);
-    }
-
-    /**
-     * Reads the {@code seqTxn} stamped into the footer of the {@code _pm}
-     * snapshot identified by {@code parquetFileSize}, opening and mapping the
-     * file for the duration of the call. {@code parquetFileSize} is the parquet
-     * file size from {@code _txn} field 3, used as the MVCC version token: the
-     * footer the chain walk settles on is the one whose derived parquet file
-     * size matches, which need not be the latest snapshot.
-     * <p>
-     * Returns {@code -1} when the file is missing or unreadable, when no footer
-     * in the chain matches {@code parquetFileSize}, or when the matched footer
-     * carries no {@code seqTxn}. Treat any non-negative result as the version's
-     * {@code seqTxn} and {@code -1} as "absent" — the same convention the
-     * footer's unset sentinel uses.
-     *
-     * @param ff              files facade
-     * @param path            path to the {@code _pm} file
-     * @param parquetFileSize parquet file size from {@code _txn}, the MVCC
-     *                        version token selecting the footer to read
-     * @return the matched footer's {@code seqTxn}, or {@code -1} if absent
-     * @throws CairoException on malformed {@code _pm} data
-     */
-    public long readSeqTxnForVersion(FilesFacade ff, LPSZ path, long parquetFileSize) {
-        long mappedAddr = 0;
-        long mappedSize = 0;
-        try {
-            mappedAddr = openAndMapRO(ff, path, this);
-            if (mappedAddr == 0) {
-                return -1;
-            }
-            // Capture the mapping size before clear() zeros it; needed for munmap.
-            mappedSize = fileSize;
-            if (!resolveFooter(parquetFileSize)) {
-                return -1;
-            }
-            // readPartitionMeta0 re-derives the footer from the size passed in,
-            // so feed it the resolved snapshot's committed size to read the
-            // selected version's seqTxn rather than the latest footer's.
-            final long buf = Unsafe.malloc(24, MemoryTag.NATIVE_DEFAULT);
-            try {
-                readPartitionMeta0(mappedAddr, resolvedFileSize, buf);
-                return Unsafe.getLong(buf + 16);
-            } finally {
-                Unsafe.free(buf, 24, MemoryTag.NATIVE_DEFAULT);
-            }
-        } finally {
-            clear();
-            if (mappedAddr != 0) {
-                ff.munmap(mappedAddr, mappedSize, MemoryTag.MMAP_PARQUET_METADATA_READER);
-            }
-        }
+        readPartitionMeta0(getOrCreateNativeReaderPtr(), destAddr);
     }
 
     /**
@@ -716,11 +668,10 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
         // file. Single-bit disk rot or RAM corruption otherwise passes the
         // structural bound checks and is served as authoritative metadata
         // steering SQL row-group pruning and remote-storage byte-range reads.
-        // The check parses the file once; the cached flag stops re-verifying
-        // on subsequent canSkipRowGroup calls. verifyChecksum0 throws
-        // CairoException on mismatch, null pointer, or unparseable file.
         if (!checksumVerified) {
-            verifyChecksum0(addr, parquetMetaFileSize);
+            assert nativeReaderPtr == 0; // of()/clear() reset the handle with the flag
+            nativeReaderPtr = createNativeReader(addr, parquetMetaFileSize, true);
+            nativeReaderFileSize = parquetMetaFileSize;
             checksumVerified = true;
         }
 
@@ -926,7 +877,15 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
             }
         }
 
-        // All validations passed — commit state.
+        // All validations passed — commit state. The native handle parses one
+        // snapshot; when the walk settled on a different one — an older
+        // footer than the verified-parse handle, or a re-resolve that picked
+        // another version — it must not keep serving the old parse.
+        if (nativeReaderPtr != 0 && nativeReaderFileSize != currentSize) {
+            destroyNativeReader(nativeReaderPtr);
+            nativeReaderPtr = 0;
+            nativeReaderFileSize = 0;
+        }
         this.footerAddr = footerAddr;
         this.resolvedFileSize = currentSize;
         this.columnCount = columnCount;
@@ -942,18 +901,24 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
             long filterBufEnd
     );
 
-    private static native long createNativeReader(long addr, long fileSize);
+    /**
+     * Parses {@code [addr, addr + fileSize)} and returns the cached native
+     * reader handle. With {@code verifyChecksum} set, also verifies the
+     * footer CRC32 before returning, so the once-per-open verification's
+     * parse is kept rather than discarded.
+     */
+    private static native long createNativeReader(long addr, long fileSize, boolean verifyChecksum);
 
     private static native void destroyNativeReader(long ptr);
 
-    private static native void readPartitionMeta0(long parquetMetaAddr, long parquetMetaSize, long destAddr);
+    private static native void readPartitionMeta0(long ptr, long destAddr);
 
     /**
-     * Verifies the CRC32 stored in the {@code _pm} footer.
-     * Throws {@link CairoException} on mismatch, null pointer, or any
-     * structural error encountered while parsing the file.
+     * Returns the {@code seqTxn} of the footer the cached native reader is
+     * bound to, or {@code -1} when that footer carries none. A field read
+     * off the parsed footer; no reparse.
      */
-    private static native void verifyChecksum0(long addr, long fileSize);
+    private static native long readSeqTxn0(long ptr);
 
     /**
      * Computes the absolute memory address of a column chunk within a row group block.
