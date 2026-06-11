@@ -32,6 +32,7 @@ import io.questdb.cairo.PartitionBy;
 import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TxReader;
 import io.questdb.cairo.TxWriter;
 import io.questdb.cairo.mig.EngineMigration;
 import io.questdb.cairo.mig.Mig941;
@@ -1151,6 +1152,123 @@ public class Mig941Test extends AbstractCairoTest {
                 path.of(configuration.getDbRoot()).concat(token);
                 TableUtils.setPathForParquetPartitionMetadata(path, ColumnType.TIMESTAMP, PartitionBy.DAY, partitionTs, partitionNameTxn);
                 Assert.assertEquals("re-running the migration must not change the _pm", firstRunSize, ff.length(path.$()));
+            }
+        });
+    }
+
+    @Test
+    public void testMigrateSkipsRemotePartitionWithoutDataParquet() throws Exception {
+        // A remotely served partition has had its data.parquet uploaded
+        // and the local copy removed, leaving only _pm; its _txn entry stays
+        // parquet-format with REMOTE set and parquet_generated cleared.
+        assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
+            execute("CREATE TABLE t (id INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("INSERT INTO t VALUES(1, '2024-06-10T00:00:00.000000Z')," +
+                    "(2, '2024-06-11T00:00:00.000000Z')," +
+                    "(3, '2024-06-12T00:00:00.000000Z')");
+            execute("ALTER TABLE t CONVERT PARTITION TO PARQUET WHERE ts > 0");
+
+            final FilesFacade ff = configuration.getFilesFacade();
+            final TableToken token = engine.verifyTableName("t");
+
+            long remotePartitionTs;
+            long remotePartitionNameTxn;
+            long warmPartitionTs;
+            long warmPartitionNameTxn;
+            try (TableReader reader = engine.getReader(token)) {
+                Assert.assertEquals(3, reader.getPartitionCount());
+                Assert.assertTrue("first partition must be parquet", reader.getTxFile().isPartitionParquet(0));
+                Assert.assertTrue("second partition must be parquet", reader.getTxFile().isPartitionParquet(1));
+                Assert.assertFalse("third (active) partition must be native", reader.getTxFile().isPartitionParquet(2));
+                remotePartitionTs = reader.getTxFile().getPartitionTimestampByIndex(0);
+                remotePartitionNameTxn = reader.getTxFile().getPartitionNameTxn(0);
+                warmPartitionTs = reader.getTxFile().getPartitionTimestampByIndex(1);
+                warmPartitionNameTxn = reader.getTxFile().getPartitionNameTxn(1);
+            }
+
+            engine.releaseAllWriters();
+            engine.releaseAllReaders();
+            engine.releaseInactive();
+
+            // mark the partition as remotely served
+            try (Path path = new Path()) {
+                path.of(configuration.getDbRoot()).concat(token).concat(TableUtils.TXN_FILE_NAME);
+                try (TxWriter txWriter = new TxWriter(ff, configuration).ofRW(path.$(), ColumnType.TIMESTAMP, PartitionBy.DAY)) {
+                    txWriter.setPartitionParquetGenerated(remotePartitionTs, false);
+                    txWriter.setPartitionRemoteByTimestamp(remotePartitionTs, true);
+                    txWriter.commit(new ObjList<>());
+                }
+            }
+            try (Path path = new Path()) {
+                path.of(configuration.getDbRoot()).concat(token).concat(TableUtils.TXN_FILE_NAME);
+                try (TxReader txReader = new TxReader(ff)) {
+                    txReader.ofRO(path.$(), ColumnType.TIMESTAMP, PartitionBy.DAY);
+                    txReader.unsafeLoadAll();
+                    Assert.assertTrue("partition 0 must be stamped remotely served", txReader.isPartitionRemotelyServed(0));
+                    Assert.assertFalse("partition 1 must remain a normal parquet partition", txReader.isPartitionRemotelyServed(1));
+                }
+            }
+
+            // The remote partition keeps only _pm; its data.parquet is gone.
+            // Capture the _pm length to prove the skip leaves it untouched.
+            long remotePmSize;
+            try (Path path = new Path()) {
+                path.of(configuration.getDbRoot()).concat(token);
+                TableUtils.setPathForParquetPartition(path, ColumnType.TIMESTAMP, PartitionBy.DAY, remotePartitionTs, remotePartitionNameTxn);
+                Assert.assertTrue("remote partition data.parquet should exist before deletion", ff.exists(path.$()));
+                ff.remove(path.$());
+                Assert.assertFalse("remote partition data.parquet must be deleted", ff.exists(path.$()));
+
+                path.of(configuration.getDbRoot()).concat(token);
+                TableUtils.setPathForParquetPartitionMetadata(path, ColumnType.TIMESTAMP, PartitionBy.DAY, remotePartitionTs, remotePartitionNameTxn);
+                remotePmSize = ff.length(path.$());
+                Assert.assertTrue("remote partition _pm should exist with positive size", remotePmSize > 0);
+            }
+
+            // Delete the warm partition's _pm so the migration must regenerate it.
+            try (Path path = new Path()) {
+                path.of(configuration.getDbRoot()).concat(token);
+                TableUtils.setPathForParquetPartitionMetadata(path, ColumnType.TIMESTAMP, PartitionBy.DAY, warmPartitionTs, warmPartitionNameTxn);
+                ff.remove(path.$());
+                Assert.assertFalse("warm partition _pm should be deleted", ff.exists(path.$()));
+            }
+
+            // Must complete without throwing despite the remote partition's absent data.parquet.
+            runMig941(token);
+
+            // remote partition: skipped. data.parquet stays absent (the migration
+            // never tried to read it) and its _pm is left exactly as it was.
+            try (Path path = new Path()) {
+                path.of(configuration.getDbRoot()).concat(token);
+                TableUtils.setPathForParquetPartition(path, ColumnType.TIMESTAMP, PartitionBy.DAY, remotePartitionTs, remotePartitionNameTxn);
+                Assert.assertFalse("migration must not recreate the remote partition's data.parquet", ff.exists(path.$()));
+
+                path.of(configuration.getDbRoot()).concat(token);
+                TableUtils.setPathForParquetPartitionMetadata(path, ColumnType.TIMESTAMP, PartitionBy.DAY, remotePartitionTs, remotePartitionNameTxn);
+                Assert.assertTrue("remote partition _pm must survive the skip", ff.exists(path.$()));
+                Assert.assertEquals("skipped remote partition _pm must be left untouched", remotePmSize, ff.length(path.$()));
+            }
+
+            // Warm partition: _pm regenerated and valid, proving the migration
+            // ran past the skipped remote partition to completion.
+            try (Path path = new Path()) {
+                path.of(configuration.getDbRoot()).concat(token);
+                TableUtils.setPathForParquetPartitionMetadata(path, ColumnType.TIMESTAMP, PartitionBy.DAY, warmPartitionTs, warmPartitionNameTxn);
+                Assert.assertTrue("warm partition _pm must be regenerated", ff.exists(path.$()));
+
+                long parquetMetaSize = ParquetMetaFileReader.readParquetMetaFileSize(ff, path.$());
+                Assert.assertTrue("warm partition _pm should have positive size", parquetMetaSize > 0);
+
+                long parquetMetaAddr = TableUtils.mapRO(ff, path.$(), LOG, parquetMetaSize, MemoryTag.MMAP_DEFAULT);
+                try {
+                    ParquetMetaFileReader reader = new ParquetMetaFileReader();
+                    reader.of(parquetMetaAddr, parquetMetaSize);
+                    reader.resolveFooter(Long.MAX_VALUE);
+                    Assert.assertEquals(2, reader.getColumnCount());
+                    Assert.assertEquals(1, reader.getRowGroupCount());
+                } finally {
+                    ff.munmap(parquetMetaAddr, parquetMetaSize, MemoryTag.MMAP_DEFAULT);
+                }
             }
         });
     }
