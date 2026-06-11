@@ -1096,4 +1096,47 @@ mod tests {
         assert_eq!(&buf[bloom_end..bloom_end + 8], &7i64.to_le_bytes());
         assert_eq!(bloom_end + 8, start + footer.crc_offset());
     }
+
+    #[test]
+    fn unknown_optional_flag_with_trailing_payload_accepted() {
+        // Forward-compat: a newer writer set an unknown optional footer bit and
+        // appended its section after the known ones. This reader skips the
+        // unknown bytes and accepts the footer -- `Footer::new` tolerates
+        // `sections_end < crc_offset`.
+        let unknown_bit: u64 = 1 << 5;
+        let trailing_payload = [0xABu8; 12];
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u64.to_le_bytes()); // parquet_footer_offset
+        buf.extend_from_slice(&0u32.to_le_bytes()); // parquet_footer_length
+        buf.extend_from_slice(&0u32.to_le_bytes()); // row_group_count
+        buf.extend_from_slice(&0u64.to_le_bytes()); // unused_bytes
+        buf.extend_from_slice(&0u64.to_le_bytes()); // prev_parquet_meta_file_size
+        let flags = FooterFeatureFlags::SEQ_TXN_BIT | unknown_bit;
+        buf.extend_from_slice(&flags.to_le_bytes());
+        // Known section: seq_txn (bit 0), 8 bytes.
+        buf.extend_from_slice(&7i64.to_le_bytes());
+        // Unknown optional section (bit 5): opaque payload this reader skips.
+        let known_sections_end = buf.len();
+        buf.extend_from_slice(&trailing_payload);
+        buf.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder
+        let footer_len = buf.len() as u32;
+        buf.extend_from_slice(&footer_len.to_le_bytes());
+
+        let footer = Footer::new(&buf, footer_len, 0).unwrap();
+
+        // The unknown bit is preserved; the known accessors ignore it.
+        assert_eq!(footer.feature_flags().0, flags);
+        assert!(footer.feature_flags().has_seq_txn());
+        assert_eq!(footer.seq_txn(), Some(SeqTxn::new(7)));
+        assert_eq!(footer.scratchpad_entries().count(), 0);
+
+        // Trailing payload sits between the known sections and the CRC:
+        // `sections_end < crc_offset` is tolerated, not rejected.
+        assert_eq!(
+            footer.crc_offset(),
+            known_sections_end + trailing_payload.len()
+        );
+        assert!(footer.crc_offset() > known_sections_end);
+    }
 }

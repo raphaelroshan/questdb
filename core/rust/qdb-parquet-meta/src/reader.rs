@@ -688,6 +688,26 @@ mod tests {
     }
 
     #[test]
+    fn unknown_optional_footer_flags_accepted() {
+        use crate::types::FOOTER_FEATURE_FLAGS_OFF;
+
+        let mut w = ParquetMetaWriter::new();
+        w.add_column("x", 0, 5, ColumnFlags::new(), 0, 0, 0, 0);
+        let (mut bytes, parquet_meta_file_size) = w.finish().unwrap();
+
+        // Set an unknown optional bit (bit 5). The forward-compat contract is
+        // accept-and-ignore for the optional range (bits 0-31); the negative
+        // mirror is `unknown_required_footer_flags_rejected`.
+        let footer_offset = footer_offset_of(&bytes, parquet_meta_file_size);
+        let flags_off = footer_offset as usize + FOOTER_FEATURE_FLAGS_OFF;
+        let optional_bit: u64 = 1 << 5;
+        bytes[flags_off..flags_off + 8].copy_from_slice(&optional_bit.to_le_bytes());
+
+        let reader = ParquetMetaReader::from_file_size(&bytes, parquet_meta_file_size).unwrap();
+        assert_eq!(reader.footer_feature_flags().0, optional_bit);
+    }
+
+    #[test]
     fn multiple_row_groups_with_stats() {
         let mut w = ParquetMetaWriter::new();
         w.add_column(
