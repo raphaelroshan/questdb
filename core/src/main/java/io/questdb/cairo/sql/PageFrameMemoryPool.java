@@ -24,6 +24,7 @@
 
 package io.questdb.cairo.sql;
 
+import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.ColumnType;
 import io.questdb.griffin.engine.table.parquet.ParquetDecoder;
 import io.questdb.griffin.engine.table.parquet.ParquetFileDecoder;
@@ -1226,14 +1227,6 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
             decodeResources.clear();
         }
 
-        // Takes ownership of the lease the just-completed decode acquired, if any.
-        private void retainDecodeResource(ParquetDecoder decoder) {
-            final long resource = decoder.takeDecodeResource();
-            if (resource != 0) {
-                decodeResources.add(resource);
-            }
-        }
-
         // Fan the decoded buffers out to query columns. parquetColumns is
         // deduplicated, so when several query columns reference the same
         // parquet column they share one decode slot and copy the same
@@ -1300,6 +1293,14 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
                     auxPageAddresses.set(q, rowGroupBuffers.getChunkAuxPtr(columnOffset + slot));
                     auxPageSizes.set(q, rowGroupBuffers.getChunkAuxSize(columnOffset + slot));
                 }
+            }
+        }
+
+        // Takes ownership of the lease the just-completed decode acquired, if any.
+        private void retainDecodeResource(ParquetDecoder decoder) {
+            final long resource = decoder.takeDecodeResource();
+            if (resource != 0) {
+                decodeResources.add(resource);
             }
         }
     }
