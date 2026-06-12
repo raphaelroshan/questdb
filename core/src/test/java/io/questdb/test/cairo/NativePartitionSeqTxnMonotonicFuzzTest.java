@@ -138,7 +138,7 @@ public class NativePartitionSeqTxnMonotonicFuzzTest extends AbstractCairoTest {
                 final long stamp = tx.getNativePartitionSeqTxn(i);
                 final long canon = canonical.getOrDefault(floor, 0L);
                 Assert.assertTrue(table + " floor=" + floor + " stamp=" + stamp + " < canonical=" + canon
-                        + " -- offset-3 must never under-approximate (would corrupt the cold dedup gate)",
+                                + " -- offset-3 must never under-approximate (would corrupt the cold dedup gate)",
                         stamp >= canon);
                 Assert.assertTrue(table + " floor=" + floor + " stamp=" + stamp + " > highWater=" + highWater,
                         stamp <= highWater);
