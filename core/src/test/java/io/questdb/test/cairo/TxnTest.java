@@ -40,6 +40,7 @@ import io.questdb.log.LogFactory;
 import io.questdb.std.Files;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.FilesFacadeImpl;
+import io.questdb.std.LongList;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.ObjList;
 import io.questdb.std.Os;
@@ -98,6 +99,154 @@ public class TxnTest extends AbstractCairoTest {
                     tr.unsafeLoadAll();
                     Assert.assertEquals("fresh slot must store a clean 0, not -1", 0L, tr.rawOffset3(0));
                     Assert.assertEquals("cleared slot must store a clean 0, not -1", 0L, tr.rawOffset3(1));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDumpToClearsParquetGeneratedForNativePartitionOnly() throws Exception {
+        // dumpTo is the _txn serializer for a backup/checkpoint snapshot (its only production caller is
+        // DatabaseCheckpointAgent). A native partition's generated data.parquet only duplicates the
+        // native columns and is omitted from a backup, so the snapshot must not claim it. This asserts
+        // dumpTo clears parquet_generated for a native partition, leaves a parquet-format partition (whose
+        // data.parquet IS backed up) alone, and -- critically -- never alters the live _txn.
+        TestUtils.assertMemoryLeak(() -> {
+            final FilesFacade ff = engine.getConfiguration().getFilesFacade();
+            final String tableName = "txnDumpParquetGenerated";
+            final TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY);
+            model.timestamp();
+            AbstractCairoTest.create(model);
+
+            try (Path path = new Path(); Path dumpPath = new Path()) {
+                final TableToken tableToken = engine.verifyTableName(tableName);
+                path.of(configuration.getDbRoot()).concat(tableToken).concat(TXN_FILE_NAME).$();
+                dumpPath.of(configuration.getDbRoot()).concat(tableToken).concat("_txn.backup").$();
+                final int tsType = TableUtils.getTimestampType(model);
+
+                // idx : state                       F  G  R  U   off-3   dumpTo clears G?
+                //  0  : native + generated          0  1  0  0   seqTxn  yes (upload-while-native)
+                //  1  : native + generated + sealed  0  1  1  1   seqTxn  yes (read-only/remote must not matter)
+                //  2  : parquet-local + generated    1  1  0  0   size    no  (its data.parquet is backed up)
+                //  3  : cold / remotely served       1  0  1  1   size    no  (already cleared)
+                //  4  : plain native                 0  0  0  0   seqTxn  no  (never had it)
+                try (TxWriter tw = new TxWriter(ff, configuration).ofRW(path.$(), tsType, PartitionBy.DAY)) {
+                    for (int i = 0; i < 5; i++) {
+                        tw.updatePartitionSizeByTimestamp(i * Micros.DAY_MICROS, i + 1);
+                    }
+                    tw.updateMaxTimestamp(5 * Micros.DAY_MICROS + 1);
+                    tw.finishPartitionSizeUpdate();
+                    applyVersionState(tw, 0, false, true, false, false, 101L);
+                    applyVersionState(tw, 1, false, true, true, true, 102L);
+                    applyVersionState(tw, 2, true, true, false, false, 4096L);
+                    applyVersionState(tw, 3, true, false, true, true, 8192L);
+                    applyVersionState(tw, 4, false, false, false, false, 105L);
+                    tw.commit(new ObjList<>());
+                }
+
+                try (TxReader live = new TxReader(ff)) {
+                    live.ofRO(path.$(), tsType, PartitionBy.DAY);
+                    live.unsafeLoadAll();
+
+                    // The live _txn (what a running table reads) keeps every flag: a commit never
+                    // touches parquet_generated.
+                    assertVersionState(live, 0, false, true, false, false, 101L);
+                    assertVersionState(live, 1, false, true, true, true, 102L);
+                    assertVersionState(live, 2, true, true, false, false, 4096L);
+                    assertVersionState(live, 3, true, false, true, true, 8192L);
+                    assertVersionState(live, 4, false, false, false, false, 105L);
+
+                    try (MemoryCMARW dumpMem = Vm.getCMARWInstance()) {
+                        dumpMem.smallFile(ff, dumpPath.$(), MemoryTag.MMAP_DEFAULT);
+                        live.dumpTo(dumpMem);
+                        // dumpTo writes at absolute offsets without advancing the append pointer;
+                        // close(false) flushes without truncating the file to that (zero) pointer.
+                        dumpMem.close(false);
+                    }
+
+                    // dumpTo writes into the passed-in buffer; the live reader is untouched.
+                    assertVersionState(live, 0, false, true, false, false, 101L);
+                    assertVersionState(live, 1, false, true, true, true, 102L);
+                }
+
+                // The backup snapshot clears parquet_generated only for the native partitions (0, 1),
+                // independent of read-only/remote, and leaves every other flag and offset-3 value intact.
+                try (TxReader backup = new TxReader(ff)) {
+                    backup.ofRO(dumpPath.$(), tsType, PartitionBy.DAY);
+                    backup.unsafeLoadAll();
+                    assertVersionState(backup, 0, false, false, false, false, 101L);
+                    assertVersionState(backup, 1, false, false, true, true, 102L);
+                    assertVersionState(backup, 2, true, true, false, false, 4096L);
+                    assertVersionState(backup, 3, true, false, true, true, 8192L);
+                    assertVersionState(backup, 4, false, false, false, false, 105L);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDumpToScrubsUntrustedNativeOffset3() throws Exception {
+        // A backup snapshot must never carry a native offset-3 word lacking the VALID bit: restored,
+        // such a word would re-enter as the released-base file-size poison -- and the G-clear above
+        // even strips the one bit hinting at its provenance. Untrusted native words scrub to the
+        // cleared 0, REMOTE included (a native slot cannot legitimately be REMOTE without a valid
+        // stamp); stamped native words and parquet file sizes (valid without the bit) survive.
+        TestUtils.assertMemoryLeak(() -> {
+            final FilesFacade ff = engine.getConfiguration().getFilesFacade();
+            final String tableName = "txnDumpScrub";
+            final TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY);
+            model.timestamp();
+            AbstractCairoTest.create(model);
+
+            try (Path path = new Path(); Path dumpPath = new Path()) {
+                final TableToken tableToken = engine.verifyTableName(tableName);
+                path.of(configuration.getDbRoot()).concat(tableToken).concat(TXN_FILE_NAME).$();
+                dumpPath.of(configuration.getDbRoot()).concat(tableToken).concat("_txn.backup").$();
+                final int tsType = TableUtils.getTimestampType(model);
+
+                // idx : live state                                       backup offset-3
+                //  0  : native, G=1, file-size poison (poked, no VALID)  scrubbed to 0 (G cleared too)
+                //  1  : native, stamped (VALID)                          kept verbatim
+                //  2  : parquet, plain file size (no VALID)              kept verbatim
+                //  3  : native, legacy -1 (poked)                        canonical 0
+                //  4  : native, poison + REMOTE (poked, no VALID)        whole word scrubbed to 0
+                try (TxWriter tw = new TxWriter(ff, configuration).ofRW(path.$(), tsType, PartitionBy.DAY)) {
+                    for (int i = 0; i < 5; i++) {
+                        tw.updatePartitionSizeByTimestamp(i * Micros.DAY_MICROS, 1);
+                    }
+                    tw.updateMaxTimestamp(5 * Micros.DAY_MICROS + 1);
+                    tw.finishPartitionSizeUpdate();
+                    tw.setPartitionParquetGenerated(0, true);
+                    tw.setPartitionSeqTxn(1, 101L);
+                    tw.setPartitionParquet(2 * Micros.DAY_MICROS, 4096L);
+                    tw.commit(new ObjList<>());
+                }
+
+                try (RawOffset3Reader live = new RawOffset3Reader(ff)) {
+                    live.ofRO(path.$(), tsType, PartitionBy.DAY);
+                    live.unsafeLoadAll();
+                    live.pokeRawOffset3(0, 50_000_000L);
+                    live.pokeRawOffset3(3, -1L);
+                    live.pokeRawOffset3(4, 50_000_000L | TxReader.PARTITION_REMOTE_BIT);
+
+                    try (MemoryCMARW dumpMem = Vm.getCMARWInstance()) {
+                        dumpMem.smallFile(ff, dumpPath.$(), MemoryTag.MMAP_DEFAULT);
+                        live.dumpTo(dumpMem);
+                        dumpMem.close(false);
+                    }
+                }
+
+                try (RawOffset3Reader backup = new RawOffset3Reader(ff)) {
+                    backup.ofRO(dumpPath.$(), tsType, PartitionBy.DAY);
+                    backup.unsafeLoadAll();
+                    Assert.assertEquals("the poison must scrub to the canonical cleared 0", 0L, backup.rawOffset3(0));
+                    Assert.assertFalse("G clears alongside (the existing dumpTo rule)",
+                            backup.isPartitionParquetGenerated(0));
+                    Assert.assertEquals("a stamped word survives the dump", 101L, backup.getNativePartitionSeqTxn(1));
+                    Assert.assertEquals("a parquet file size is valid without the bit",
+                            4096L, backup.getPartitionParquetFileSize(2));
+                    Assert.assertEquals("the legacy -1 scrubs to the canonical 0", 0L, backup.rawOffset3(3));
+                    Assert.assertEquals("REMOTE goes with the untrusted word", 0L, backup.rawOffset3(4));
                 }
             }
         });
@@ -286,86 +435,6 @@ public class TxnTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testDumpToClearsParquetGeneratedForNativePartitionOnly() throws Exception {
-        // dumpTo is the _txn serializer for a backup/checkpoint snapshot (its only production caller is
-        // DatabaseCheckpointAgent). A native partition's generated data.parquet only duplicates the
-        // native columns and is omitted from a backup, so the snapshot must not claim it. This asserts
-        // dumpTo clears parquet_generated for a native partition, leaves a parquet-format partition (whose
-        // data.parquet IS backed up) alone, and -- critically -- never alters the live _txn.
-        TestUtils.assertMemoryLeak(() -> {
-            final FilesFacade ff = engine.getConfiguration().getFilesFacade();
-            final String tableName = "txnDumpParquetGenerated";
-            final TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY);
-            model.timestamp();
-            AbstractCairoTest.create(model);
-
-            try (Path path = new Path(); Path dumpPath = new Path()) {
-                final TableToken tableToken = engine.verifyTableName(tableName);
-                path.of(configuration.getDbRoot()).concat(tableToken).concat(TXN_FILE_NAME).$();
-                dumpPath.of(configuration.getDbRoot()).concat(tableToken).concat("_txn.backup").$();
-                final int tsType = TableUtils.getTimestampType(model);
-
-                // idx : state                       F  G  R  U   off-3   dumpTo clears G?
-                //  0  : native + generated          0  1  0  0   seqTxn  yes (upload-while-native)
-                //  1  : native + generated + sealed  0  1  1  1   seqTxn  yes (read-only/remote must not matter)
-                //  2  : parquet-local + generated    1  1  0  0   size    no  (its data.parquet is backed up)
-                //  3  : cold / remotely served       1  0  1  1   size    no  (already cleared)
-                //  4  : plain native                 0  0  0  0   seqTxn  no  (never had it)
-                try (TxWriter tw = new TxWriter(ff, configuration).ofRW(path.$(), tsType, PartitionBy.DAY)) {
-                    for (int i = 0; i < 5; i++) {
-                        tw.updatePartitionSizeByTimestamp(i * Micros.DAY_MICROS, i + 1);
-                    }
-                    tw.updateMaxTimestamp(5 * Micros.DAY_MICROS + 1);
-                    tw.finishPartitionSizeUpdate();
-                    applyVersionState(tw, 0, false, true, false, false, 101L);
-                    applyVersionState(tw, 1, false, true, true, true, 102L);
-                    applyVersionState(tw, 2, true, true, false, false, 4096L);
-                    applyVersionState(tw, 3, true, false, true, true, 8192L);
-                    applyVersionState(tw, 4, false, false, false, false, 105L);
-                    tw.commit(new ObjList<>());
-                }
-
-                try (TxReader live = new TxReader(ff)) {
-                    live.ofRO(path.$(), tsType, PartitionBy.DAY);
-                    live.unsafeLoadAll();
-
-                    // The live _txn (what a running table reads) keeps every flag: a commit never
-                    // touches parquet_generated.
-                    assertVersionState(live, 0, false, true, false, false, 101L);
-                    assertVersionState(live, 1, false, true, true, true, 102L);
-                    assertVersionState(live, 2, true, true, false, false, 4096L);
-                    assertVersionState(live, 3, true, false, true, true, 8192L);
-                    assertVersionState(live, 4, false, false, false, false, 105L);
-
-                    try (MemoryCMARW dumpMem = Vm.getCMARWInstance()) {
-                        dumpMem.smallFile(ff, dumpPath.$(), MemoryTag.MMAP_DEFAULT);
-                        live.dumpTo(dumpMem);
-                        // dumpTo writes at absolute offsets without advancing the append pointer;
-                        // close(false) flushes without truncating the file to that (zero) pointer.
-                        dumpMem.close(false);
-                    }
-
-                    // dumpTo writes into the passed-in buffer; the live reader is untouched.
-                    assertVersionState(live, 0, false, true, false, false, 101L);
-                    assertVersionState(live, 1, false, true, true, true, 102L);
-                }
-
-                // The backup snapshot clears parquet_generated only for the native partitions (0, 1),
-                // independent of read-only/remote, and leaves every other flag and offset-3 value intact.
-                try (TxReader backup = new TxReader(ff)) {
-                    backup.ofRO(dumpPath.$(), tsType, PartitionBy.DAY);
-                    backup.unsafeLoadAll();
-                    assertVersionState(backup, 0, false, false, false, false, 101L);
-                    assertVersionState(backup, 1, false, false, true, true, 102L);
-                    assertVersionState(backup, 2, true, true, false, false, 4096L);
-                    assertVersionState(backup, 3, true, false, true, true, 8192L);
-                    assertVersionState(backup, 4, false, false, false, false, 105L);
-                }
-            }
-        });
-    }
-
-    @Test
     public void testLoadTxn() throws IOException {
         try (Path p = new Path()) {
             final String incrementalLoad;
@@ -380,6 +449,70 @@ public class TxnTest extends AbstractCairoTest {
                 TestUtils.assertEquals(incrementalLoad, tw.toString());
             }
         }
+    }
+
+    @Test
+    public void testNativeSeqTxnValidBitQuarantinesUntrustedWords() throws Exception {
+        // Offset-3 of a native partition reads as a seqTxn only when the word carries
+        // PARTITION_SEQ_TXN_VALID_BIT. The released base stored the generated data.parquet FILE SIZE
+        // there (no flag bits) -- by value indistinguishable from a seqTxn -- so an unflagged word is
+        // quarantined to -1 instead of trusted. The legacy all-ones -1 word has bit 62 SET: the
+        // cleared-sentinel fold must run before the bit test, or it would read as a colossal "valid"
+        // value. getPartitionVersion stays ungated: it is the raw staleness identity, never a seqTxn.
+        TestUtils.assertMemoryLeak(() -> {
+            FilesFacade ff = engine.getConfiguration().getFilesFacade();
+            String tableName = "verValidBit";
+            TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY);
+            model.timestamp();
+            AbstractCairoTest.create(model);
+
+            try (Path path = new Path()) {
+                TableToken tableToken = engine.verifyTableName(tableName);
+                path.of(configuration.getDbRoot()).concat(tableToken).concat(TXN_FILE_NAME).$();
+                int tsType = TableUtils.getTimestampType(model);
+
+                // idx 0: stamped + REMOTE (VALID rides under bit 63); idx 1: legacy file-size poison
+                // (poked); idx 2: legacy -1 (poked); idx 3: corrupt VALID-with-zero (poked); idx 4: fresh 0.
+                try (TxWriter tw = new TxWriter(ff, configuration).ofRW(path.$(), tsType, PartitionBy.DAY)) {
+                    for (int i = 0; i < 5; i++) {
+                        tw.updatePartitionSizeByTimestamp(i * Micros.DAY_MICROS, 1);
+                    }
+                    tw.updateMaxTimestamp(5 * Micros.DAY_MICROS + 1);
+                    tw.finishPartitionSizeUpdate();
+                    tw.setPartitionSeqTxn(0, 4096L);
+                    tw.setPartitionRemote(0, true);
+                    tw.commit(new ObjList<>());
+                }
+
+                try (RawOffset3Reader tr = new RawOffset3Reader(ff)) {
+                    tr.ofRO(path.$(), tsType, PartitionBy.DAY);
+                    tr.unsafeLoadAll();
+                    Assert.assertEquals(5, tr.getPartitionCount());
+
+                    // the stamp wrote VALID; REMOTE rides along without disturbing the read
+                    Assert.assertNotEquals("a positive stamp must carry VALID",
+                            0L, tr.rawOffset3(0) & TxReader.PARTITION_SEQ_TXN_VALID_BIT);
+                    Assert.assertTrue(tr.isPartitionRemote(0));
+                    Assert.assertEquals(4096L, tr.getNativePartitionSeqTxn(0));
+
+                    // released-base poison: a file size with no flag bits
+                    tr.pokeRawOffset3(1, 50_000_000L);
+                    Assert.assertEquals("an unflagged word must be quarantined", -1L, tr.getNativePartitionSeqTxn(1));
+                    Assert.assertEquals("the identity accessor stays raw", 50_000_000L, tr.getPartitionVersion(1));
+
+                    // legacy -1: bit 62 is set as part of all-ones; the cleared fold must win
+                    tr.pokeRawOffset3(2, -1L);
+                    Assert.assertEquals("the cleared fold must precede the bit test", -1L, tr.getNativePartitionSeqTxn(2));
+
+                    // corrupt "valid zero": no writer produces it; the value fold quarantines it
+                    tr.pokeRawOffset3(3, TxReader.PARTITION_SEQ_TXN_VALID_BIT);
+                    Assert.assertEquals("a non-positive valid word must fold to -1", -1L, tr.getNativePartitionSeqTxn(3));
+
+                    // fresh slot reads as no version, exactly as before
+                    Assert.assertEquals(-1L, tr.getNativePartitionSeqTxn(4));
+                }
+            }
+        });
     }
 
     @Test
@@ -811,8 +944,9 @@ public class TxnTest extends AbstractCairoTest {
     public void testSetPartitionRemoteOnClearedSlotNormalizes() throws Exception {
         // Setting REMOTE on a cleared slot must not throw and must not strand the bit on the
         // sentinel's stray bits (e.g. -1 | REMOTE == -1, still read as cleared): it normalizes the
-        // slot to 0 first, so REMOTE reads back true and the version reads 0. Covers both cleared
-        // words -- the -1 sentinel and a plain 0 slot.
+        // slot to 0 first, so REMOTE reads back true while the version still reads -1 -- the word
+        // carries no VALID stamp, and REMOTE alone must not manufacture a trusted version. Covers
+        // both cleared words -- the -1 sentinel and a plain 0 slot.
         TestUtils.assertMemoryLeak(() -> {
             FilesFacade ff = engine.getConfiguration().getFilesFacade();
             assertMemoryLeak(() -> {
@@ -832,8 +966,8 @@ public class TxnTest extends AbstractCairoTest {
                         Assert.assertEquals(-1L, tw.getNativePartitionSeqTxn(0));
                         tw.setPartitionRemote(0, true);
                         Assert.assertTrue("REMOTE set on the -1 slot reads back true", tw.isPartitionRemote(0));
-                        Assert.assertEquals("the -1 slot is normalized to 0 before the bit is applied",
-                                0L, tw.getNativePartitionSeqTxn(0));
+                        Assert.assertEquals("an unstamped slot reads no-version even with REMOTE set",
+                                -1L, tw.getNativePartitionSeqTxn(0));
 
                         // Clearing REMOTE returns the slot to the cleared state.
                         tw.setPartitionRemote(0, false);
@@ -1219,6 +1353,63 @@ public class TxnTest extends AbstractCairoTest {
         });
     }
 
+    @Test
+    public void testValidBitLifecycleAcrossFormatFlips() throws Exception {
+        // VALID is managed by the stamping setters and setPartitionFormat: set with every positive
+        // native stamp (the flip to native included), cleared on the flip to parquet (a file size is
+        // valid without it), preserved by setPartitionRemote, and never set by a 0 stamp -- the 0
+        // stamp writes the cleared word, so "valid with value 0" is unrepresentable by a writer.
+        TestUtils.assertMemoryLeak(() -> {
+            FilesFacade ff = engine.getConfiguration().getFilesFacade();
+            String tableName = "verValidFlips";
+            TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY);
+            model.timestamp();
+            AbstractCairoTest.create(model);
+
+            try (Path path = new Path()) {
+                TableToken tableToken = engine.verifyTableName(tableName);
+                path.of(configuration.getDbRoot()).concat(tableToken).concat(TXN_FILE_NAME).$();
+                int tsType = TableUtils.getTimestampType(model);
+                try (TxWriter tw = new TxWriter(ff, configuration).ofRW(path.$(), tsType, PartitionBy.DAY)) {
+                    long ts = 0;
+                    tw.updatePartitionSizeByTimestamp(ts, 1);
+
+                    // positive stamp -> VALID
+                    tw.setPartitionSeqTxn(0, 7L);
+                    Assert.assertNotEquals(0L, RawOffset3Reader.rawOffset3Of(tw, 0) & TxReader.PARTITION_SEQ_TXN_VALID_BIT);
+                    Assert.assertEquals(7L, tw.getNativePartitionSeqTxn(0));
+
+                    // REMOTE preserves VALID; the stamp stays trusted
+                    tw.setPartitionRemote(0, true);
+                    Assert.assertNotEquals(0L, RawOffset3Reader.rawOffset3Of(tw, 0) & TxReader.PARTITION_SEQ_TXN_VALID_BIT);
+                    Assert.assertEquals(7L, tw.getNativePartitionSeqTxn(0));
+
+                    // flip to parquet: VALID cleared, REMOTE preserved, the file size reads
+                    tw.setPartitionParquet(ts, 4096L);
+                    Assert.assertEquals(0L, RawOffset3Reader.rawOffset3Of(tw, 0) & TxReader.PARTITION_SEQ_TXN_VALID_BIT);
+                    Assert.assertTrue(tw.isPartitionRemote(0));
+                    Assert.assertEquals(4096L, tw.getPartitionParquetFileSize(0));
+
+                    // flip back to native with a real seqTxn: VALID set, reads through
+                    tw.setPartitionNative(ts, 9L);
+                    Assert.assertNotEquals(0L, RawOffset3Reader.rawOffset3Of(tw, 0) & TxReader.PARTITION_SEQ_TXN_VALID_BIT);
+                    Assert.assertEquals(9L, tw.getNativePartitionSeqTxn(0));
+
+                    // 0 stamp: the cleared word, no VALID -- reads as the -1 sentinel
+                    tw.setPartitionSeqTxn(0, 0L);
+                    Assert.assertEquals(0L, RawOffset3Reader.rawOffset3Of(tw, 0));
+                    Assert.assertEquals(-1L, tw.getNativePartitionSeqTxn(0));
+
+                    // flip to native with seqTxn 0 (the non-WAL convert-back): cleared, untrusted
+                    tw.setPartitionParquet(ts, 4096L);
+                    tw.setPartitionNative(ts, 0L);
+                    Assert.assertEquals(0L, RawOffset3Reader.rawOffset3Of(tw, 0) & TxReader.PARTITION_SEQ_TXN_VALID_BIT);
+                    Assert.assertEquals(-1L, tw.getNativePartitionSeqTxn(0));
+                }
+            }
+        });
+    }
+
     private static void applyVersionState(TxWriter tw, int idx, boolean parquet, boolean generated, boolean readOnly, boolean remote, long value) {
         long ts = tw.getPartitionTimestampByIndex(idx);
         if (parquet) {
@@ -1369,6 +1560,14 @@ public class TxnTest extends AbstractCairoTest {
             super(ff);
         }
 
+        // Raw offset-3 read on any reader/writer instance via the public partition-info dump;
+        // TxWriter is final, so the in-memory poke route only exists on this reader subclass.
+        static long rawOffset3Of(TxReader tx, int partitionIndex) {
+            final LongList raw = new LongList();
+            tx.dumpRawTxPartitionInfo(raw);
+            return raw.getQuick(partitionIndex * TableUtils.LONGS_PER_TX_ATTACHED_PARTITION + PARTITION_VERSION_OFFSET);
+        }
+
         void pokeRawOffset3(int partitionIndex, long word) {
             attachedPartitions.setQuick(partitionIndex * TableUtils.LONGS_PER_TX_ATTACHED_PARTITION + PARTITION_VERSION_OFFSET, word);
         }
@@ -1377,6 +1576,7 @@ public class TxnTest extends AbstractCairoTest {
             return attachedPartitions.getQuick(partitionIndex * TableUtils.LONGS_PER_TX_ATTACHED_PARTITION + PARTITION_VERSION_OFFSET);
         }
     }
+
 
     static class SymbolCountProviderImpl implements SymbolCountProvider {
         private final int count;

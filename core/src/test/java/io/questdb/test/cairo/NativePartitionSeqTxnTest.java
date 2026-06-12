@@ -34,6 +34,8 @@ import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.TableWriter;
 import io.questdb.cairo.TxReader;
 import io.questdb.cairo.TxWriter;
+import io.questdb.cairo.vm.Vm;
+import io.questdb.cairo.vm.api.MemoryCMARW;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.str.Path;
@@ -760,6 +762,58 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testSquashOverUntrustedSeqTxnNeverPromotesIt() throws Exception {
+        // The laundering hazard: squashSplitPartitions reads each source's seqTxn and restamps the
+        // merge with the max. A released-base word (a parquet file size, no VALID bit) on one split
+        // must not be promoted into a trusted stamp by that read -- the gated read quarantines it to
+        // -1 (floored to 0 by the merge), so the result is max(trusted sources), never the file size.
+        assertMemoryLeak(() -> {
+            node1.setProperty(PropertyKey.CAIRO_O3_PARTITION_SPLIT_MIN_SIZE, 4 << 10);
+            node1.setProperty(PropertyKey.CAIRO_O3_LAST_PARTITION_MAX_SPLITS, 2);
+
+            execute("CREATE TABLE xq (ts TIMESTAMP, y LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO xq SELECT timestamp_sequence('2020-02-04T00', 60*1000000L), x FROM long_sequence(1320)");
+            drainWalQueue();
+            // O3 write into the middle of 2020-02-04 splits it.
+            execute("INSERT INTO xq SELECT timestamp_sequence('2020-02-04T20:01', 1000000L), x FROM long_sequence(200)");
+            drainWalQueue();
+
+            final TableToken tt = engine.verifyTableName("xq");
+            final long trustedSeqTxn;
+            try (TableReader reader = getReader("xq")) {
+                TxReader tx = reader.getTxFile();
+                Assert.assertEquals("2020-02-04 must be split into two sub-partitions", 2, tx.getPartitionCount());
+                // The lo split carries the split-commit stamp; the hi split is the active
+                // partition, unstamped until a later commit closes it.
+                trustedSeqTxn = tx.getNativePartitionSeqTxn(0);
+                Assert.assertTrue(trustedSeqTxn > 0);
+            }
+
+            // Poison the hi split with a released-base word: a big file size, no flag bits.
+            final long poison = 50_000_000L;
+            pokeRawOffset3OnDisk(tt, 1, poison);
+            try (TableReader reader = getReader("xq")) {
+                Assert.assertEquals("the poisoned split must read quarantined",
+                        -1L, reader.getTxFile().getNativePartitionSeqTxn(1));
+            }
+
+            // A later partition makes 2020-02-04 non-active, then squash forces the merge.
+            execute("INSERT INTO xq VALUES ('2020-02-05T00:00:00', 1)");
+            drainWalQueue();
+            execute("ALTER TABLE xq SQUASH PARTITIONS");
+            drainWalQueue();
+
+            try (TableReader reader = getReader("xq")) {
+                TxReader tx = reader.getTxFile();
+                Assert.assertEquals("2020-02-04 merged back to one partition, plus 2020-02-05", 2, tx.getPartitionCount());
+                final long mergedSeqTxn = tx.getNativePartitionSeqTxn(0);
+                Assert.assertNotEquals("the file size must never be promoted into a stamp", poison, mergedSeqTxn);
+                Assert.assertEquals("the merge stamps max(trusted sources)", trustedSeqTxn, mergedSeqTxn);
+            }
+        });
+    }
+
+    @Test
     public void testSquashStampsMaxSourceSeqTxnNotHighWater() throws Exception {
         // squashSplitPartitions stamps the merged partition with max(merged sources' seqTxn), not the
         // table high-water. Build a split partition last written at seqTxn S, let the high-water climb
@@ -1019,6 +1073,36 @@ public class NativePartitionSeqTxnTest extends AbstractCairoTest {
             TableUtils.setPathForNativePartition(p, tsType, PartitionBy.DAY, partitionTimestamp, partitionNameTxn);
             p.concat(TableUtils.PARQUET_PARTITION_NAME).$();
             Assert.assertTrue("plant empty data.parquet", ff.touch(p.$()));
+        }
+    }
+
+    // Rewrites a partition's raw offset-3 _txn word with an in-place 8-byte file write, no version
+    // bump -- exactly the bytes the released base left behind (it stored the generated data.parquet
+    // file size there with no flag bits). Pooled writers/readers are purged first so every later
+    // open reloads the poked word.
+    private void pokeRawOffset3OnDisk(TableToken tt, int partitionIndex, long word) {
+        final int tsType;
+        try (TableReader reader = engine.getReader(tt)) {
+            tsType = reader.getTxFile().getTimestampType();
+        }
+        engine.releaseInactive();
+        final FilesFacade ff = configuration.getFilesFacade();
+        try (Path path = new Path()) {
+            path.of(configuration.getDbRoot()).concat(tt).concat(TableUtils.TXN_FILE_NAME);
+            final long fileOffset;
+            try (TxReader txReader = new TxReader(ff)) {
+                txReader.ofRO(path.$(), tsType, PartitionBy.DAY);
+                txReader.unsafeLoadAll();
+                // raw long index of the partition's offset-3 (version) slot in the partition table
+                final int rawIndex = partitionIndex * TableUtils.LONGS_PER_TX_ATTACHED_PARTITION + 3;
+                fileOffset = txReader.getBaseOffset() + TableUtils.getPartitionTableIndexOffset(
+                        TableUtils.getPartitionTableSizeOffset(txReader.getSymbolColumnCount()), rawIndex);
+            }
+            try (MemoryCMARW mem = Vm.getCMARWInstance()) {
+                mem.smallFile(ff, path.$(), MemoryTag.MMAP_DEFAULT);
+                mem.putLong(fileOffset, word);
+                mem.close(false);
+            }
         }
     }
 }

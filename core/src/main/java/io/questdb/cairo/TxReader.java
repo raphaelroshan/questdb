@@ -48,8 +48,16 @@ public class TxReader implements Closeable, Mutable {
     public static final long DEFAULT_PARTITION_TIMESTAMP = 0L;
     public static final long PARTITION_FLAGS_MASK = 0x7FFFF00000000000L;
     // Flag in the high byte of the offset-3 partition-version word: a remote copy of the
-    // partition's parquet data exists. Only ever set on parquet partitions.
-    public static final long PARTITION_PARQUET_REMOTE_BIT = 1L << 63;
+    // partition's parquet data exists. Set on parquet partitions and on native partitions
+    // uploaded while native (upload-while-native keeps the format bit 0).
+    public static final long PARTITION_REMOTE_BIT = 1L << 63;
+    // Flag in the high byte of the offset-3 word: the value was written as a native seqTxn
+    // stamp by a stamp-aware binary. Released binaries stored a parquet file size in this slot
+    // for parquet_generated native partitions; without this bit such a legacy word is
+    // indistinguishable from a seqTxn, so the native read quarantines it (returns -1) instead
+    // of trusting it. Meaningful for native-format words only; a parquet word holds the file
+    // size and is valid without it.
+    public static final long PARTITION_SEQ_TXN_VALID_BIT = 1L << 62;
     public static final long PARTITION_SIZE_MASK = 0x80000FFFFFFFFFFFL;
     public static final int PARTITION_SQUASH_COUNTER_MAX = 0xFFFF;
     public static final long PARTITION_VERSION_FLAGS_MASK = 0xFFL << 56;
@@ -77,12 +85,16 @@ public class TxReader implements Closeable, Mutable {
     // the last long (PARTITION_VERSION_OFFSET) holds, for a parquet partition the parquet file
     // size, for a native one its last-modifying seqTxn:
     //
-    // |  remote  | reserved | value (parquet file size / native seqTxn) |
-    // +----------+----------+-------------------------------------------+
-    // |  1 bit   |  7 bits  |                 56 bits                   |
+    // |  remote  |  valid   | reserved | value (parquet file size / native seqTxn) |
+    // +----------+----------+----------+-------------------------------------------+
+    // |  1 bit   |  1 bit   |  6 bits  |                 56 bits                   |
     //
     // remote is cleared by the value writes that supersede the bytes (setPartitionParquetFileSize, setPartitionSeqTxn),
     // so it can't outlive them; setPartitionFormat preserves it, leaving REMOTE to caller discipline on a format flip.
+    // valid (PARTITION_SEQ_TXN_VALID_BIT) accompanies every positive native seqTxn stamp; a native word without it is
+    // untrusted and reads as -1 (quarantines the released-binary file-size poison). A 0 stamp writes the cleared word,
+    // so "valid with value 0" is unrepresentable. setPartitionFormat sets it flipping to native, clears it flipping to
+    // parquet (a parquet word is valid without it).
     // legacy: a cleared slot reads as 0L (written today) or -1L (older binaries), both folded by isPartitionOffset3Cleared().
     protected static final int PARTITION_TS_OFFSET = 0;
     protected static final int PARTITION_VERSION_OFFSET = 3;
@@ -190,6 +202,18 @@ public class TxReader implements Closeable, Mutable {
                 if (!isPartitionParquet(partitionIndex) && isPartitionParquetGenerated(partitionIndex)) {
                     value &= ~(1L << PARTITION_MASK_PARQUET_GENERATED_BIT_OFFSET);
                 }
+            } else if (i % LONGS_PER_TX_ATTACHED_PARTITION == PARTITION_VERSION_OFFSET) {
+                // A native offset-3 word without the VALID bit is untrusted (a released binary
+                // stored a parquet file size there): scrub it to the cleared sentinel so a backup
+                // never carries the ambiguous word. The whole word goes, including bit 63 -- a
+                // native slot cannot legitimately be REMOTE without a valid stamp. Parquet words
+                // hold the file size and are valid without the bit; leave them. The cleared 0L/-1L
+                // sentinels scrub to the canonical 0L, a no-op in meaning.
+                final int partitionIndex = i / LONGS_PER_TX_ATTACHED_PARTITION;
+                if (!isPartitionParquet(partitionIndex)
+                        && (isPartitionOffset3Cleared(value) || (value & PARTITION_SEQ_TXN_VALID_BIT) == 0)) {
+                    value = 0L;
+                }
             }
             long offset = TableUtils.getPartitionTableIndexOffset(partitionTableOffset, i);
             mem.putLong(baseOffset + offset, value);
@@ -292,8 +316,14 @@ public class TxReader implements Closeable, Mutable {
 
     /**
      * Returns a native partition's last-modifying seqTxn from the offset-3 word
-     * (bit 63 REMOTE masked off), or -1 when the version is unknown. Native-only:
+     * (flag bits masked off), or -1 when the version is unknown or untrusted. Native-only:
      * for a parquet partition offset 3 holds the file size, read it via the parquet accessor.
+     * <p>
+     * A word without {@link #PARTITION_SEQ_TXN_VALID_BIT} is quarantined to -1: released
+     * binaries stored a parquet file size in this slot for {@code parquet_generated} native
+     * partitions, and after an upgrade such a word is indistinguishable from a seqTxn by value
+     * alone. Quarantined slots heal with a real stamp on the next write or at parquet
+     * generation; callers needing a version sooner must stamp one themselves.
      * <p>
      * Contract: this is a monotonic-safe version hint, NOT a deterministic identity. It is
      * always {@code >=} the highest seqTxn that actually wrote the partition, and it strictly
@@ -304,7 +334,15 @@ public class TxReader implements Closeable, Mutable {
      */
     public long getNativePartitionSeqTxn(int partitionIndex) {
         assert !isPartitionParquet(partitionIndex);
-        return getPartitionVersionByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION);
+        final int rawIndex = partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION;
+        // getPartitionOffset3 folds the cleared 0L/-1L sentinels to 0 before the bit test;
+        // the legacy all-ones word has bit 62 set and must not read as a valid stamp.
+        if ((getPartitionOffset3(rawIndex) & PARTITION_SEQ_TXN_VALID_BIT) == 0) {
+            return -1L;
+        }
+        final long seqTxn = getPartitionVersionByRawIndex(rawIndex);
+        // a positive stamp is guaranteed by the writer; fold a corrupt non-positive word
+        return seqTxn > 0 ? seqTxn : -1L;
     }
 
     public long getNextExistingPartitionTimestamp(long timestamp) {
@@ -563,7 +601,7 @@ public class TxReader implements Closeable, Mutable {
     }
 
     public boolean isPartitionRemoteByRawIndex(int indexRaw) {
-        return (getPartitionOffset3(indexRaw) & PARTITION_PARQUET_REMOTE_BIT) != 0;
+        return (getPartitionOffset3(indexRaw) & PARTITION_REMOTE_BIT) != 0;
     }
 
     public boolean isPartitionRemotelyServed(int i) {

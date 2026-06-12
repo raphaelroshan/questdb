@@ -971,10 +971,12 @@ public class O3SquashPartitionTest extends AbstractCairoTest {
             );
             drainWalQueue();
 
+            final long lastWriteSeqTxn;
             try (TableWriter writer = getWriter("x")) {
                 TxWriter tx = writer.getTxWriter();
                 Assert.assertTrue("test setup must create a split partition", tx.getPartitionCount() > 1);
                 Assert.assertFalse(tx.isPartitionParquet(0));
+                lastWriteSeqTxn = tx.getSeqTxn();
                 tx.setPartitionRemote(0, true);
                 tx.setPartitionParquetGenerated(0, true);
                 writer.bumpPartitionTableVersion();
@@ -991,8 +993,10 @@ public class O3SquashPartitionTest extends AbstractCairoTest {
                         reader.getTxFile().isPartitionRemote(0));
                 Assert.assertFalse("squash invalidates any staged parquet for the old bytes",
                         reader.getTxFile().isPartitionParquetGenerated(0));
-                Assert.assertEquals("squash must stamp the target with the squash commit seqTxn",
-                        reader.getTxFile().getSeqTxn(), reader.getTxFile().getNativePartitionSeqTxn(0));
+                Assert.assertEquals("squash stamps max(merged sources) -- the last write's seqTxn, not the squash commit's",
+                        lastWriteSeqTxn, reader.getTxFile().getNativePartitionSeqTxn(0));
+                Assert.assertTrue("the squash commit advanced the table seqTxn past the stamp",
+                        reader.getTxFile().getSeqTxn() > lastWriteSeqTxn);
             }
 
             assertQuery("SELECT count(), sum(j) FROM x")

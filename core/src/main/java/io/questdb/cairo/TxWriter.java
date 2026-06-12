@@ -436,7 +436,7 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         if (indexRaw < 0) {
             throw CairoException.nonCritical().put("bad partition index -1");
         }
-        long flags = getPartitionOffset3(indexRaw) & PARTITION_VERSION_FLAGS_MASK & ~PARTITION_PARQUET_REMOTE_BIT;
+        long flags = getPartitionOffset3(indexRaw) & PARTITION_VERSION_FLAGS_MASK & ~PARTITION_REMOTE_BIT;
         attachedPartitions.setQuick(indexRaw + PARTITION_VERSION_OFFSET, (size & PARTITION_VERSION_VALUE_MASK) | flags);
     }
 
@@ -485,8 +485,8 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         }
         final long word = getPartitionOffset3(indexRaw);
         final long updated = isRemote
-                ? word | PARTITION_PARQUET_REMOTE_BIT
-                : word & ~PARTITION_PARQUET_REMOTE_BIT;
+                ? word | PARTITION_REMOTE_BIT
+                : word & ~PARTITION_REMOTE_BIT;
         attachedPartitions.setQuick(indexRaw + PARTITION_VERSION_OFFSET, updated);
     }
 
@@ -501,13 +501,16 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
     /**
      * Stamps a native partition's last-modifying seqTxn into the offset-3 word, preserving
      * reserved flag bits. Clears REMOTE and parquet_generated: the stamp records a data
-     * change, so no remote or generated copy matches the bytes anymore. The non-WAL path
-     * stamps 0, the cleared word, which reads back as the -1 "no version" sentinel.
+     * change, so no remote or generated copy matches the bytes anymore. A positive stamp
+     * carries {@link TxReader#PARTITION_SEQ_TXN_VALID_BIT}, marking the word a trusted seqTxn
+     * (untrusted legacy words read as -1). The non-WAL path stamps 0, the cleared word, which
+     * reads back as the -1 "no version" sentinel.
      */
     public void setPartitionSeqTxnByRawIndex(int indexRaw, long seqTxn) {
         setPartitionParquetGeneratedByRawIndex(indexRaw, false);
-        long flags = getPartitionOffset3(indexRaw) & PARTITION_VERSION_FLAGS_MASK & ~PARTITION_PARQUET_REMOTE_BIT;
-        attachedPartitions.setQuick(indexRaw + PARTITION_VERSION_OFFSET, (seqTxn & PARTITION_VERSION_VALUE_MASK) | flags);
+        long flags = getPartitionOffset3(indexRaw) & PARTITION_VERSION_FLAGS_MASK & ~(PARTITION_REMOTE_BIT | PARTITION_SEQ_TXN_VALID_BIT);
+        final long valid = seqTxn > 0 ? PARTITION_SEQ_TXN_VALID_BIT : 0L;
+        attachedPartitions.setQuick(indexRaw + PARTITION_VERSION_OFFSET, (seqTxn & PARTITION_VERSION_VALUE_MASK) | flags | valid);
     }
 
     public void setSeqTxn(long seqTxn) {
@@ -790,7 +793,10 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
 
         attachedPartitions.setQuick(offset, maskedSize);
 
-        final long flags = getPartitionOffset3(indexRaw) & PARTITION_VERSION_FLAGS_MASK;
+        long flags = getPartitionOffset3(indexRaw) & PARTITION_VERSION_FLAGS_MASK & ~PARTITION_SEQ_TXN_VALID_BIT;
+        if (!isParquetFormat && version > 0) {
+            flags |= PARTITION_SEQ_TXN_VALID_BIT;
+        }
         attachedPartitions.setQuick(indexRaw + PARTITION_VERSION_OFFSET, (version & PARTITION_VERSION_VALUE_MASK) | flags);
     }
 
