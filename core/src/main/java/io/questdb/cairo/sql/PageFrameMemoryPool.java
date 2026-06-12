@@ -107,7 +107,6 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
     // decode pass (excluded from the include/exclude filter, or absent
     // from the parquet file because it was added later).
     private final IntIntHashMap parquetIdxToDecodeSlot;
-    private final ParquetPartitionDecoder parquetMetaDecoder;
     private final IntList queryToSlot = new IntList(16);
     private ParquetDecoder activeDecoder;
     private PageFrameAddressCache addressCache;
@@ -125,6 +124,8 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
     private boolean hasFullProjectionMap;
     private ParquetBuffers lruHead;
     private ParquetBuffers lruTail;
+    // Created lazily on the first parquet frame so the configuration's decoder factory is fully wired.
+    private ParquetPartitionDecoder parquetMetaDecoder;
 
     public PageFrameMemoryPool(CairoConfiguration configuration, long maxCacheBytes) {
         try {
@@ -147,7 +148,7 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
     }
 
     public PageFrameMemoryPool(CairoConfiguration configuration) {
-        PageFrameMemoryPool(configuration, configuration.getSqlParquetCacheMemorySize());
+        this(configuration, configuration.getSqlParquetCacheMemorySize());
     }
 
     @Override
@@ -909,7 +910,7 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
                 pageAddresses = new DirectLongList(16, MemoryTag.NATIVE_DEFAULT);
                 pageSizes = new DirectLongList(16, MemoryTag.NATIVE_DEFAULT);
                 rowGroupBuffers = new RowGroupBuffers(MemoryTag.NATIVE_PARQUET_PARTITION_DECODER);
-                decodeResources = = new DirectLongList(2, MemoryTag.NATIVE_DEFAULT, true);
+                decodeResources = new DirectLongList(2, MemoryTag.NATIVE_DEFAULT);
             } catch (Throwable th) {
                 Misc.free(auxPageAddresses);
                 Misc.free(auxPageSizes);
