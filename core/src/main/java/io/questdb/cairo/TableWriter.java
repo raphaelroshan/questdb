@@ -4685,35 +4685,6 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
         return txnScoreboard.isRangeAvailable(fromTxn, toTxn);
     }
 
-    private void cancelOrphanedCommands() {
-        long cursor;
-        while ((cursor = commandSubSeq.next()) > -1) {
-            try {
-                final TableWriterTask cmd = commandQueue.get(cursor);
-                if (cmd.getType() != CMD_ALTER_TABLE) {
-                    AsyncWriterCommand asyncCmd = asyncCommandCache.get(cmd.getType());
-                    if (asyncCmd == null) {
-                        final AsyncWriterCommand fromTask = cmd.getAsyncWriterCommand();
-                        asyncCmd = fromTask != null ? fromTask.newInstance() : null;
-                        if (asyncCmd == null) {
-                            asyncCmd = fromTask;
-                        }
-                    }
-                    if (asyncCmd != null) {
-                        asyncCmd.deserialize(cmd).abandon();
-                    }
-                }
-            } catch (Throwable th) {
-                LOG.critical()
-                        .$("could not abandon orphaned async command [table=").$(tableToken)
-                        .$(", err=").$(th)
-                        .I$();
-            } finally {
-                commandSubSeq.done(cursor);
-            }
-        }
-    }
-
     private void cancelRowAndBump() {
         rowCancel();
         masterRef++;
@@ -6356,20 +6327,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
         Misc.free(columnVersionWriter);
         Misc.free(o3PartitionUpdateSink);
         Misc.free(slaveTxReader);
-        if (commandSubSeq != null) {
-            // Same invariant as the seal-purge wrap above: the drain calls virtual
-            // ENT-overridable methods, and a throw escaping here would skip every
-            // free below and the lock release.
-            try {
-                cancelOrphanedCommands();
-            } catch (Throwable th) {
-                LOG.critical()
-                        .$("orphaned command cancel failed on writer close [table=").$(tableToken)
-                        .$(", err=").$(th)
-                        .I$();
-            }
-            Misc.free(commandQueue);
-        }
+        Misc.free(commandQueue);
         Misc.free(dedupColumnCommitAddresses);
         Misc.free(parquetDecoder);
         Misc.free(parquetFileDecoder);

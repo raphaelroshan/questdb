@@ -32,12 +32,6 @@ import java.io.Closeable;
 
 public interface AsyncWriterCommand extends TableMetadataChange, Closeable {
 
-    /**
-     * Notifies a queued command that the writer is tearing it down without ever applying it.
-     */
-    default void abandon() {
-    }
-
     AsyncWriterCommand deserialize(TableWriterTask task);
 
     int getCmdType();
