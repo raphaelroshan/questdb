@@ -121,13 +121,15 @@ pub fn decode_single_timestamp_value(
 /// Builds a [`Descriptor`] from `_pm` column descriptor fields.
 ///
 /// `logical_type` and `converted_type` are set to `None` — the decode
-/// dispatch (Phase 1C) no longer depends on them.
+/// dispatch (Phase 1C) no longer depends on them. `field_info.name` is left
+/// empty for the same reason: the decode path never reads it (error context
+/// carries the column name separately), and a non-empty name would be cloned
+/// into every `SlicedDataPage` the page reader yields.
 pub fn reconstruct_descriptor(
     physical_type_u8: u8,
     fixed_byte_len: i32,
     max_rep_level: u8,
     max_def_level: u8,
-    name: &str,
     repetition: Repetition,
 ) -> Descriptor {
     let physical_type = match physical_type_u8 {
@@ -143,7 +145,7 @@ pub fn reconstruct_descriptor(
     };
     Descriptor {
         primitive_type: PrimitiveType {
-            field_info: FieldInfo { name: name.to_string(), repetition, id: None },
+            field_info: FieldInfo { name: String::new(), repetition, id: None },
             logical_type: None,
             converted_type: None,
             physical_type,
@@ -682,7 +684,6 @@ mod tests {
             0,
             desc.max_rep_level as u8,
             desc.max_def_level as u8,
-            "col",
             prim.field_info.repetition,
         );
 
@@ -732,49 +733,49 @@ mod tests {
 
     #[test]
     fn reconstruct_boolean() {
-        let desc = reconstruct_descriptor(0, 0, 0, 1, "flag", Repetition::Optional);
+        let desc = reconstruct_descriptor(0, 0, 0, 1, Repetition::Optional);
         assert_eq!(desc.primitive_type.physical_type, PhysicalType::Boolean);
     }
 
     #[test]
     fn reconstruct_int32() {
-        let desc = reconstruct_descriptor(1, 0, 0, 1, "count", Repetition::Required);
+        let desc = reconstruct_descriptor(1, 0, 0, 1, Repetition::Required);
         assert_eq!(desc.primitive_type.physical_type, PhysicalType::Int32);
     }
 
     #[test]
     fn reconstruct_int64() {
-        let desc = reconstruct_descriptor(2, 0, 0, 0, "big_count", Repetition::Required);
+        let desc = reconstruct_descriptor(2, 0, 0, 0, Repetition::Required);
         assert_eq!(desc.primitive_type.physical_type, PhysicalType::Int64);
     }
 
     #[test]
     fn reconstruct_int96() {
-        let desc = reconstruct_descriptor(3, 0, 0, 1, "nano_ts", Repetition::Optional);
+        let desc = reconstruct_descriptor(3, 0, 0, 1, Repetition::Optional);
         assert_eq!(desc.primitive_type.physical_type, PhysicalType::Int96);
     }
 
     #[test]
     fn reconstruct_float() {
-        let desc = reconstruct_descriptor(4, 0, 0, 1, "temperature", Repetition::Optional);
+        let desc = reconstruct_descriptor(4, 0, 0, 1, Repetition::Optional);
         assert_eq!(desc.primitive_type.physical_type, PhysicalType::Float);
     }
 
     #[test]
     fn reconstruct_double() {
-        let desc = reconstruct_descriptor(5, 0, 0, 0, "price", Repetition::Required);
+        let desc = reconstruct_descriptor(5, 0, 0, 0, Repetition::Required);
         assert_eq!(desc.primitive_type.physical_type, PhysicalType::Double);
     }
 
     #[test]
     fn reconstruct_byte_array() {
-        let desc = reconstruct_descriptor(6, 0, 0, 1, "payload", Repetition::Optional);
+        let desc = reconstruct_descriptor(6, 0, 0, 1, Repetition::Optional);
         assert_eq!(desc.primitive_type.physical_type, PhysicalType::ByteArray);
     }
 
     #[test]
     fn reconstruct_flba_16() {
-        let desc = reconstruct_descriptor(7, 16, 0, 1, "uuid", Repetition::Optional);
+        let desc = reconstruct_descriptor(7, 16, 0, 1, Repetition::Optional);
         assert_eq!(
             desc.primitive_type.physical_type,
             PhysicalType::FixedLenByteArray(16)
@@ -783,7 +784,7 @@ mod tests {
 
     #[test]
     fn reconstruct_flba_32() {
-        let desc = reconstruct_descriptor(7, 32, 0, 1, "hash256", Repetition::Optional);
+        let desc = reconstruct_descriptor(7, 32, 0, 1, Repetition::Optional);
         assert_eq!(
             desc.primitive_type.physical_type,
             PhysicalType::FixedLenByteArray(32)
@@ -792,7 +793,7 @@ mod tests {
 
     #[test]
     fn reconstruct_flba_arbitrary() {
-        let desc = reconstruct_descriptor(7, 5, 0, 0, "short_fixed", Repetition::Required);
+        let desc = reconstruct_descriptor(7, 5, 0, 0, Repetition::Required);
         assert_eq!(
             desc.primitive_type.physical_type,
             PhysicalType::FixedLenByteArray(5)
@@ -801,7 +802,7 @@ mod tests {
 
     #[test]
     fn reconstruct_invalid_phys_fallback() {
-        let desc = reconstruct_descriptor(99, 0, 0, 0, "unknown", Repetition::Required);
+        let desc = reconstruct_descriptor(99, 0, 0, 0, Repetition::Required);
         assert_eq!(desc.primitive_type.physical_type, PhysicalType::Int64);
     }
 
@@ -819,7 +820,7 @@ mod tests {
         ];
         for &(phys_id, ref expected_phys) in type_ids {
             let flba_len = if phys_id == 7 { 12 } else { 0 };
-            let desc = reconstruct_descriptor(phys_id, flba_len, 0, 0, "col", Repetition::Required);
+            let desc = reconstruct_descriptor(phys_id, flba_len, 0, 0, Repetition::Required);
             assert_eq!(&desc.primitive_type.physical_type, expected_phys);
             assert!(
                 desc.primitive_type.logical_type.is_none(),
@@ -835,32 +836,33 @@ mod tests {
     }
 
     #[test]
-    fn reconstruct_preserves_rep_def_name() {
+    fn reconstruct_preserves_rep_def_leaves_name_empty() {
         // rep=2, def=3
-        let desc = reconstruct_descriptor(2, 0, 2, 3, "nested_val", Repetition::Repeated);
+        let desc = reconstruct_descriptor(2, 0, 2, 3, Repetition::Repeated);
         assert_eq!(desc.max_rep_level, 2);
         assert_eq!(desc.max_def_level, 3);
-        assert_eq!(desc.primitive_type.field_info.name, "nested_val");
+        // The decode path never reads the name, so it is left empty.
+        assert!(desc.primitive_type.field_info.name.is_empty());
         assert_eq!(
             desc.primitive_type.field_info.repetition,
             Repetition::Repeated
         );
 
         // rep=0, def=0, Required
-        let desc = reconstruct_descriptor(1, 0, 0, 0, "flat_req", Repetition::Required);
+        let desc = reconstruct_descriptor(1, 0, 0, 0, Repetition::Required);
         assert_eq!(desc.max_rep_level, 0);
         assert_eq!(desc.max_def_level, 0);
-        assert_eq!(desc.primitive_type.field_info.name, "flat_req");
+        assert!(desc.primitive_type.field_info.name.is_empty());
         assert_eq!(
             desc.primitive_type.field_info.repetition,
             Repetition::Required
         );
 
         // rep=1, def=1, Optional
-        let desc = reconstruct_descriptor(5, 0, 1, 1, "opt_col", Repetition::Optional);
+        let desc = reconstruct_descriptor(5, 0, 1, 1, Repetition::Optional);
         assert_eq!(desc.max_rep_level, 1);
         assert_eq!(desc.max_def_level, 1);
-        assert_eq!(desc.primitive_type.field_info.name, "opt_col");
+        assert!(desc.primitive_type.field_info.name.is_empty());
         assert_eq!(
             desc.primitive_type.field_info.repetition,
             Repetition::Optional
@@ -872,7 +874,7 @@ mod tests {
 
     #[test]
     fn reconstruct_flba_zero_length() {
-        let desc = reconstruct_descriptor(7, 0, 0, 0, "empty_flba", Repetition::Required);
+        let desc = reconstruct_descriptor(7, 0, 0, 0, Repetition::Required);
         assert_eq!(
             desc.primitive_type.physical_type,
             PhysicalType::FixedLenByteArray(0)
@@ -925,7 +927,6 @@ mod tests {
             0,
             desc.max_rep_level as u8,
             desc.max_def_level as u8,
-            "col",
             prim.field_info.repetition,
         );
 
@@ -982,7 +983,6 @@ mod tests {
             0,
             desc.max_rep_level as u8,
             desc.max_def_level as u8,
-            "ts",
             prim.field_info.repetition,
         );
 

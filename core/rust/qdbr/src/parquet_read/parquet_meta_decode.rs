@@ -168,7 +168,6 @@ fn prepare_column<'a>(
         col_desc.fixed_byte_len,
         col_desc.max_rep_level,
         col_desc.max_def_level,
-        column_name,
         repetition,
     );
 

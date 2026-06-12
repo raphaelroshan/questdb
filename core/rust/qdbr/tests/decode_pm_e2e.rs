@@ -247,7 +247,6 @@ fn run_e2e_pipeline(parquet_bytes: &[u8]) {
                 desc.fixed_byte_len,
                 desc.max_rep_level,
                 desc.max_def_level,
-                col_name,
                 repetition,
             );
 
@@ -391,7 +390,6 @@ fn run_e2e_pipeline_multi(parquet_bytes: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) 
                 desc.fixed_byte_len,
                 desc.max_rep_level,
                 desc.max_def_level,
-                col_name,
                 repetition,
             );
 
@@ -1057,7 +1055,6 @@ fn e2e_multiple_row_groups() {
             desc.fixed_byte_len,
             desc.max_rep_level,
             desc.max_def_level,
-            col_name,
             repetition,
         );
 
@@ -1161,7 +1158,6 @@ fn run_e2e_filtered<const FILL_NULLS: bool>(parquet_bytes: &[u8], rows_filter: &
         desc.fixed_byte_len,
         desc.max_rep_level,
         desc.max_def_level,
-        col_name,
         repetition,
     );
 

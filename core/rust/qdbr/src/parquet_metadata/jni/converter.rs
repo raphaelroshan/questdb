@@ -235,7 +235,6 @@ pub(crate) fn decode_single_ts_value_from_parquet(
         },
         col_desc.descriptor.max_rep_level.try_into().unwrap_or(0),
         col_desc.descriptor.max_def_level.try_into().unwrap_or(0),
-        &column_name,
         field_info.repetition,
     );
     decode_single_timestamp_value(
