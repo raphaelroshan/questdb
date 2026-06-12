@@ -54,8 +54,8 @@ public class LatestByTask implements QuietCloseable, Mutable {
     private long valuesMemorySize;
 
     public LatestByTask(CairoConfiguration configuration) {
-        // We're using page frame memory only and do single scan, hence cache size of 1.
-        this.frameMemoryPool = new PageFrameMemoryPool(configuration, 1);
+        // Single sequential scan; no LRU caching needed across frames.
+        this.frameMemoryPool = new PageFrameMemoryPool(configuration, 0L);
     }
 
     @Override
