@@ -27,12 +27,15 @@ package io.questdb.test.griffin;
 import io.questdb.PropertyKey;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.TableWriter;
 import io.questdb.cairo.TxWriter;
 import io.questdb.cairo.pool.PoolListener;
 import io.questdb.griffin.SqlException;
+import io.questdb.griffin.engine.table.parquet.PartitionDescriptor;
+import io.questdb.griffin.engine.table.parquet.PartitionEncoder;
 import io.questdb.mp.SOCountDownLatch;
 import io.questdb.std.Files;
 import io.questdb.std.Os;
@@ -266,6 +269,63 @@ public class ShowPartitionsTest extends AbstractCairoTest {
                             2023-01-02\tfalse\tfalse\tfalse
                             2023-01-03\tfalse\tfalse\tfalse
                             """);
+        });
+    }
+
+    @Test
+    public void testShowPartitionsParquetGeneratedNotSwitchedPartition() throws Exception {
+        String tableName = testTableName(testName.getMethodName());
+        assertMemoryLeak(() -> {
+            execute(
+                    "CREATE TABLE " + tableName + " AS (" +
+                            "    SELECT x::INT id," +
+                            "        timestamp_sequence('2023-01-01', 24 * 3600 * 1_000_000L) ts" +
+                            "    FROM long_sequence(3)" +
+                            ") TIMESTAMP(ts) PARTITION BY DAY" + (isWal ? " WAL" : "")
+            );
+            if (isWal) {
+                drainWalQueue();
+            }
+
+            // Stage the generated-not-switched shape: encode the first partition to a local
+            // data.parquet, then mark it parquet_generated while it stays native-format.
+            TableToken token = engine.verifyTableName(tableName);
+            long partitionTs;
+            long dataParquetSize;
+            try (
+                    TableReader reader = engine.getReader(token);
+                    Path path = new Path();
+                    PartitionDescriptor descriptor = new PartitionDescriptor()
+            ) {
+                partitionTs = reader.getTxFile().getPartitionTimestampByIndex(0);
+                long nameTxn = reader.getTxFile().getPartitionNameTxn(0);
+                path.of(configuration.getDbRoot()).concat(token);
+                TableUtils.setPathForNativePartition(path, ColumnType.TIMESTAMP, PartitionBy.DAY, partitionTs, nameTxn);
+                path.concat(TableUtils.PARQUET_PARTITION_NAME);
+                PartitionEncoder.populateFromTableReader(reader, descriptor, 0);
+                PartitionEncoder.encode(descriptor, path);
+                dataParquetSize = configuration.getFilesFacade().length(path.$());
+                Assert.assertTrue("encoded data.parquet must have positive size", dataParquetSize > 0);
+            }
+            try (TableWriter writer = engine.getWriter(token, "test")) {
+                Assert.assertTrue("markPartitionParquetReady must accept the staged partition",
+                        writer.markPartitionParquetReady(partitionTs));
+                Assert.assertFalse("partition must stay native-format", writer.getTxWriter().isPartitionParquet(0));
+                Assert.assertTrue("partition must be parquet_generated", writer.getTxWriter().isPartitionParquetGenerated(0));
+            }
+
+            // The generated-not-switched branch stats the local data.parquet for parquetFileSize:
+            // offset 3 of _txn holds the seqTxn for a native partition, not a size.
+            assertQuery("SELECT name, isParquet, hasParquetGenerated, isRemotelyServed, parquetFileSize" +
+                    " FROM table_partitions('" + tableName + "')" +
+                    " WHERE attached" +
+                    " ORDER BY name")
+                    .noLeakCheck()
+                    .sizeMayVary()
+                    .returns("name\tisParquet\thasParquetGenerated\tisRemotelyServed\tparquetFileSize\n" +
+                            "2023-01-01\tfalse\ttrue\tfalse\t" + dataParquetSize + "\n" +
+                            "2023-01-02\tfalse\tfalse\tfalse\t-1\n" +
+                            "2023-01-03\tfalse\tfalse\tfalse\t-1\n");
         });
     }
 

@@ -1157,6 +1157,96 @@ public class Mig941Test extends AbstractCairoTest {
     }
 
     @Test
+    public void testMigrateRemoteGeneratedPartitionMasksParquetFileSize() throws Exception {
+        // A partition that is both REMOTE and parquet_generated keeps a local
+        // data.parquet, so the migration regenerates its _pm — but offset 3
+        // carries the REMOTE marker in bit 63, so the raw (negative) word must
+        // be masked before it is used as the parquet file size.
+        assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
+            execute("CREATE TABLE t (id INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("INSERT INTO t VALUES(1, '2024-06-10T00:00:00.000000Z')," +
+                    "(2, '2024-06-11T00:00:00.000000Z')");
+            execute("ALTER TABLE t CONVERT PARTITION TO PARQUET LIST '2024-06-10'");
+
+            final FilesFacade ff = configuration.getFilesFacade();
+            final TableToken token = engine.verifyTableName("t");
+
+            long partitionTs;
+            long partitionNameTxn;
+            try (TableReader reader = engine.getReader(token)) {
+                Assert.assertTrue("first partition must be parquet", reader.getTxFile().isPartitionParquet(0));
+                partitionTs = reader.getTxFile().getPartitionTimestampByIndex(0);
+                partitionNameTxn = reader.getTxFile().getPartitionNameTxn(0);
+            }
+
+            engine.releaseAllWriters();
+            engine.releaseAllReaders();
+            engine.releaseInactive();
+
+            // Stamp REMOTE while keeping parquet_generated: bit 63 of offset 3 is now
+            // set, so the raw word is negative while data.parquet stays on disk.
+            try (Path path = new Path()) {
+                path.of(configuration.getDbRoot()).concat(token).concat(TableUtils.TXN_FILE_NAME);
+                try (TxWriter txWriter = new TxWriter(ff, configuration).ofRW(path.$(), ColumnType.TIMESTAMP, PartitionBy.DAY)) {
+                    txWriter.setPartitionParquetGenerated(partitionTs, true);
+                    txWriter.setPartitionRemoteByTimestamp(partitionTs, true);
+                    txWriter.commit(new ObjList<>());
+                }
+            }
+
+            long dataParquetSize;
+            try (Path path = new Path()) {
+                path.of(configuration.getDbRoot()).concat(token).concat(TableUtils.TXN_FILE_NAME);
+                try (TxReader txReader = new TxReader(ff)) {
+                    txReader.ofRO(path.$(), ColumnType.TIMESTAMP, PartitionBy.DAY);
+                    txReader.unsafeLoadAll();
+                    Assert.assertTrue("partition 0 must be stamped remote", txReader.isPartitionRemote(0));
+                    Assert.assertTrue("partition 0 must keep parquet_generated", txReader.isPartitionParquetGenerated(0));
+                }
+
+                // The local data.parquet stays; its true length is the mask oracle.
+                path.of(configuration.getDbRoot()).concat(token);
+                TableUtils.setPathForParquetPartition(path, ColumnType.TIMESTAMP, PartitionBy.DAY, partitionTs, partitionNameTxn);
+                dataParquetSize = ff.length(path.$());
+                Assert.assertTrue("data.parquet must stay on disk", dataParquetSize > 0);
+
+                // Delete _pm so the migration must regenerate it via the masked size.
+                path.of(configuration.getDbRoot()).concat(token);
+                TableUtils.setPathForParquetPartitionMetadata(path, ColumnType.TIMESTAMP, PartitionBy.DAY, partitionTs, partitionNameTxn);
+                ff.remove(path.$());
+                Assert.assertFalse("_pm should be deleted", ff.exists(path.$()));
+            }
+
+            runMig941(token);
+
+            try (Path path = new Path()) {
+                path.of(configuration.getDbRoot()).concat(token);
+                TableUtils.setPathForParquetPartitionMetadata(path, ColumnType.TIMESTAMP, PartitionBy.DAY, partitionTs, partitionNameTxn);
+                Assert.assertTrue("_pm must be regenerated for the remote+generated partition", ff.exists(path.$()));
+
+                long parquetMetaSize = ParquetMetaFileReader.readParquetMetaFileSize(ff, path.$());
+                Assert.assertTrue("_pm should have positive size", parquetMetaSize > 0);
+
+                long parquetMetaAddr = TableUtils.mapRO(ff, path.$(), LOG, parquetMetaSize, MemoryTag.MMAP_DEFAULT);
+                try {
+                    ParquetMetaFileReader reader = new ParquetMetaFileReader();
+                    reader.of(parquetMetaAddr, parquetMetaSize);
+                    reader.resolveFooter(Long.MAX_VALUE);
+                    Assert.assertEquals(2, reader.getColumnCount());
+                    Assert.assertEquals(1, reader.getRowGroupCount());
+                    Assert.assertEquals(
+                            "the regenerated _pm must record the masked (true) parquet file size",
+                            dataParquetSize,
+                            reader.getParquetFileSize()
+                    );
+                } finally {
+                    ff.munmap(parquetMetaAddr, parquetMetaSize, MemoryTag.MMAP_DEFAULT);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testMigrateSkipsRemotePartitionWithoutDataParquet() throws Exception {
         // A remotely served partition has had its data.parquet uploaded
         // and the local copy removed, leaving only _pm; its _txn entry stays
