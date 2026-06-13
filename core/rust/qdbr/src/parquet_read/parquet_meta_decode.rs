@@ -262,10 +262,103 @@ pub fn decode_row_group(
             row_group_hi,
             prepared.column_name,
             row_group_index,
+            true,
         )?;
     }
 
     Ok(decoded)
+}
+
+/// Decode a contiguous run of whole row groups [row_group_lo_idx, row_group_hi_idx]
+/// (both inclusive) into one set of column buffers, as if they were a single row group.
+///
+/// Used by the O3 parquet merge when a timestamp value straddles row-group boundaries:
+/// the tied groups must be decoded and deduplicated together so a dedup key at the shared
+/// timestamp is compared against every existing copy, regardless of which row group holds
+/// it. Each column resets its buffer on the first group of the run and appends the rest;
+/// the var-size sinks write absolute data_vec offsets, so appended chunks stay consistent
+/// without offset fixup. The all-null-chunk fast path is intentionally NOT taken here so
+/// that every group contributes its full row count to the concatenation. Column tops are
+/// always 0 in the `_pm` decode path, so no cross-group top handling is needed.
+pub fn decode_row_group_range(
+    ctx: &mut DecodeContext,
+    row_group_bufs: &mut RowGroupBuffers,
+    source: ColumnChunkSource<'_>,
+    parquet_meta_reader: &ParquetMetaReader,
+    col_pairs: &[(ParquetColumnIndex, ColumnType)],
+    row_group_lo_idx: usize,
+    row_group_hi_idx: usize,
+) -> ParquetResult<usize> {
+    source.validate(col_pairs.len())?;
+
+    let rg_count = parquet_meta_reader.row_group_count() as usize;
+    if row_group_hi_idx >= rg_count {
+        return Err(fmt_err!(
+            InvalidType,
+            "row group index {} out of range [0,{})",
+            row_group_hi_idx,
+            rg_count
+        ));
+    }
+    if row_group_lo_idx > row_group_hi_idx {
+        return Err(fmt_err!(
+            InvalidType,
+            "row group range [{},{}] is empty",
+            row_group_lo_idx,
+            row_group_hi_idx
+        ));
+    }
+
+    let col_count = parquet_meta_reader.column_count();
+    row_group_bufs.ensure_n_columns(col_pairs.len())?;
+
+    let mut total = 0usize;
+    for (dest_col_idx, &(column_idx, to_column_type)) in col_pairs.iter().enumerate() {
+        let column_chunk_bufs = &mut row_group_bufs.column_bufs[dest_col_idx];
+        let mut col_decoded = 0usize;
+        for rg in row_group_lo_idx..=row_group_hi_idx {
+            let rg_block = parquet_meta_reader.row_group(rg)?;
+            let prepared = prepare_column(
+                parquet_meta_reader,
+                &rg_block,
+                column_idx as usize,
+                to_column_type,
+                col_count,
+            )?;
+
+            let chunk_data = source.chunk_data(
+                dest_col_idx,
+                column_idx as usize,
+                prepared.col_start,
+                prepared.col_len,
+            )?;
+
+            col_decoded += decode_column_chunk_with_params(
+                ctx,
+                column_chunk_bufs,
+                chunk_data,
+                prepared.compression,
+                prepared.descriptor,
+                prepared.num_values,
+                prepared.col_info,
+                0,
+                prepared.num_values as usize,
+                prepared.column_name,
+                rg,
+                rg == row_group_lo_idx,
+            )?;
+        }
+
+        if dest_col_idx > 0 && total != col_decoded {
+            return Err(fmt_err!(
+                InvalidLayout,
+                "column chunk size {col_decoded} does not match previous size {total}",
+            ));
+        }
+        total = col_decoded;
+    }
+
+    Ok(total)
 }
 
 /// Decode a row group with row-level filtering using `_pm` metadata.
@@ -983,6 +1076,7 @@ mod tests {
             column_top: 0,
             designated_timestamp: true,
             not_null_hint: true,
+            strided_timestamp_16: false,
             designated_timestamp_ascending: true,
             parquet_encoding_config: ParquetEncodingConfig::from_raw(0),
         };
