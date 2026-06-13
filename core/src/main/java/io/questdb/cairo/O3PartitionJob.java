@@ -766,6 +766,7 @@ public class O3PartitionJob extends AbstractQueueConsumerJob<O3PartitionTask> {
                         sortedTimestampsAddr,
                         tableWriter,
                         txn,
+                        seqTxn,
                         partitionUpdateSinkAddr,
                         o3Basket,
                         newPartitionSize
@@ -3665,6 +3666,7 @@ public class O3PartitionJob extends AbstractQueueConsumerJob<O3PartitionTask> {
             long sortedTimestampsAddr,
             TableWriter tableWriter,
             long txn,
+            long seqTxn,
             long partitionUpdateSinkAddr,
             O3Basket o3Basket,
             long newPartitionSize
@@ -3773,7 +3775,8 @@ public class O3PartitionJob extends AbstractQueueConsumerJob<O3PartitionTask> {
                     configuration.getPartitionEncoderParquetBloomFilterFpp(),
                     minCompressionRatio,
                     Files.toOsFd(parquetMetaFd),
-                    -1L
+                    -1L,
+                    seqTxn
             );
 
             parquetFileSize = ff.length(parquetPath.$());
@@ -3809,7 +3812,7 @@ public class O3PartitionJob extends AbstractQueueConsumerJob<O3PartitionTask> {
                     pathToTable,
                     parquetPath,
                     ff,
-                    ctx.getPartitionDecoder(),
+                    ctx.getPartitionDecoder(configuration),
                     metadata,
                     ctx.getParquetColumns(),
                     ctx.getRowGroupBuffers(),

@@ -8325,7 +8325,8 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                         // partitions list and mark it as parquet from inception.
                         final long partitionNameTxn = txWriter.getTxn() - 1;
                         txWriter.updateAttachedPartitionSizeByRawIndex(partitionIndexRaw, partitionTimestamp, srcDataNewPartitionSize, partitionNameTxn);
-                        txWriter.setPartitionParquetFormat(partitionTimestamp, parquetFileSize);
+                        txWriter.setPartitionParquetGenerated(partitionTimestamp, true);
+                        txWriter.setPartitionParquet(partitionTimestamp, parquetFileSize);
                         // writeFreshParquetFromO3 emits every column from row 0, so no
                         // column has a top here.
                         zeroColumnTopsAfterParquetRewrite(partitionTimestamp, srcDataNewPartitionSize, true);
