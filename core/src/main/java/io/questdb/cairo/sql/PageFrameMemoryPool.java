@@ -1167,9 +1167,12 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
                 long localRowsAddr,
                 long localRowCount
         ) {
+            // This buffer is being repurposed for a new frame; drop the prior frame's pins.
+            releaseDecodeResources();
             clearAddresses();
             if (parquetColumns.size() > 0) {
                 decoder.decodeRowGroupWithRowFilterFillNulls(rowGroupBuffers, 0, parquetColumns, rowGroup, rowLo, rowHi, localRowsAddr, localRowCount);
+                retainDecodeResource(decoder);
                 slotCount = (int) (parquetColumns.size() / 2);
                 decodedBytes = isAccountingEnabled() ? rowGroupBuffers.sumChunkBytes(0, slotCount) : 0;
             } else {
