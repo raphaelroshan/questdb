@@ -359,6 +359,10 @@ fn parquet_meta_decode_row_group_filtered_from_buffers_impl<const FILL_NULLS: bo
     if columns.is_null() && column_count > 0 {
         return Err(fmt_err!(InvalidType, "columns pointer is null"));
     }
+    if column_count > 0 {
+        let col_pairs = unsafe { slice::from_raw_parts(columns, column_count as usize) };
+        validate_jni_column_types(col_pairs)?;
+    }
     if filtered_rows_ptr.is_null() && filtered_rows_count > 0 {
         return Err(fmt_err!(InvalidType, "filtered rows pointer is null"));
     }
@@ -429,6 +433,10 @@ fn parquet_meta_decode_row_group_filtered_impl<const FILL_NULLS: bool>(
     }
     if columns.is_null() && column_count > 0 {
         return Err(fmt_err!(InvalidType, "columns pointer is null"));
+    }
+    if column_count > 0 {
+        let col_pairs = unsafe { slice::from_raw_parts(columns, column_count as usize) };
+        validate_jni_column_types(col_pairs)?;
     }
     if filtered_rows_ptr.is_null() && filtered_rows_count > 0 {
         return Err(fmt_err!(InvalidType, "filtered rows pointer is null"));

@@ -790,6 +790,11 @@ public class WalEventCursor {
         }
 
         private void read() {
+            if (nextOffset < offset) {
+                throw CairoException.critical(CairoException.METADATA_VALIDATION)
+                        .put("corrupt WAL event frame, payload size is negative [offset=").put(offset)
+                        .put(", nextOffset=").put(nextOffset).put(']');
+            }
             payloadAddr = eventMem.addressOf(offset);
             payloadSize = nextOffset - offset;
             offset = nextOffset;

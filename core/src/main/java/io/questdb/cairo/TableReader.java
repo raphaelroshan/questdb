@@ -1466,9 +1466,13 @@ public class TableReader implements Closeable, SymbolTableSource {
                                 Misc.free(parquetPartitions.getQuick(partitionIndex));
                                 parquetPartitions.setQuick(partitionIndex, NullMemoryCMR.INSTANCE);
                             }
-                        } else {
+                        } else if (txFile.isPartitionRemote(partitionIndex)) {
                             Misc.free(parquetPartitions.getQuick(partitionIndex));
                             parquetPartitions.setQuick(partitionIndex, NullMemoryCMR.INSTANCE);
+                        } else {
+                            // Local parquet partition whose data.parquet vanished. Fail loudly here
+                            // instead of stubbing, which would surface later as an obscure null pointer.
+                            throw CairoException.critical(0).put("parquet partition data file missing [path=").put(path).put(']');
                         }
                         // Initialize columns and index readers for parquet partitions.
                         // reloadColumnAt() sets columns to null (not NullMemoryCMR) for parquet,
