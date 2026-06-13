@@ -757,15 +757,15 @@ public class ShowPartitionsTest extends AbstractCairoTest {
                                 2023-01-03\tfalse\t1
                                 """);
             } else {
-                // Non-WAL native partitions are never stamped; seqTxn stays -1.
+                // Non-WAL native partitions are never stamped; seqTxn has no value, rendered null.
                 assertQuery(query)
                         .noLeakCheck()
                         .sizeMayVary()
                         .returns("""
                                 name\tisParquet\tseqTxn
-                                2023-01-01\tfalse\t-1
-                                2023-01-02\tfalse\t-1
-                                2023-01-03\tfalse\t-1
+                                2023-01-01\tfalse\tnull
+                                2023-01-02\tfalse\tnull
+                                2023-01-03\tfalse\tnull
                                 """);
             }
 
@@ -773,7 +773,7 @@ public class ShowPartitionsTest extends AbstractCairoTest {
             // The footer carries the partition's own data seqTxn (the O3 insert's commit, 2),
             // not the conversion commit's: conversion rewrites the storage format, not the data,
             // so the stamp stays at the last write the parquet contains. A non-WAL table has no
-            // WAL seqTxn, so the footer records 0.
+            // WAL seqTxn, so the footer records 0, which renders null (no value).
             execute("ALTER TABLE " + tableName + " CONVERT PARTITION TO PARQUET LIST '2023-01-01'");
             if (isWal) {
                 drainWalQueue();
@@ -784,7 +784,7 @@ public class ShowPartitionsTest extends AbstractCairoTest {
                     .noLeakCheck()
                     .noRandomAccess()
                     .sizeMayVary()
-                    .returns("name\tisParquet\tseqTxn\n2023-01-01\ttrue\t" + (isWal ? 2 : 0) + "\n");
+                    .returns("name\tisParquet\tseqTxn\n2023-01-01\ttrue\t" + (isWal ? "2" : "null") + "\n");
         });
     }
 

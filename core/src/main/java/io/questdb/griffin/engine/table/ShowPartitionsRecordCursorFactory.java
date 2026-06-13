@@ -272,7 +272,7 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
             hasParquetGenerated = false;
             isRemotelyServed = false;
             parquetFileSize = -1L;
-            seqTxn = -1L;
+            seqTxn = Numbers.LONG_NULL; // no value (non-WAL / unstamped) renders null, not -1
             minTimestamp = Numbers.LONG_NULL; // so that in absence of metadata is NaN
             maxTimestamp = Long.MIN_VALUE;
             numRows = -1L;
@@ -303,9 +303,12 @@ public class ShowPartitionsRecordCursorFactory extends AbstractRecordCursorFacto
                     parquetFileSize = ff.length(path.concat(TableUtils.PARQUET_PARTITION_NAME).$());
                     path.trimTo(dirLen);
                 }
-                seqTxn = isParquet
+                final long resolvedSeqTxn = isParquet
                         ? (parquetMetaReader != null && parquetMetaReader.isOpen() ? parquetMetaReader.getResolvedSeqTxn() : -1L)
                         : tableTxReader.getNativePartitionSeqTxn(partitionIndex);
+                // no seqTxn (non-WAL, or unstamped/legacy) resolves to 0 or -1; render null so a
+                // converted partition doesn't show 0 where its native form shows nothing.
+                seqTxn = resolvedSeqTxn > 0 ? resolvedSeqTxn : Numbers.LONG_NULL;
                 numRows = tableTxReader.getPartitionSize(partitionIndex);
             } else {
                 // partition table is over, we will iterate over detached and attachable partitions

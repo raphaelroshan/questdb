@@ -2100,10 +2100,10 @@ public final class TestUtils {
             SizePrettyFunctionFactory.toSizePretty(auxSink, size);
             line = line.replaceAll("SIZE", String.valueOf(size));
             line = line.replaceAll("HUMAN", auxSink.toString());
-            // seqTxn is -1 for non-WAL/legacy native partitions and for detached/attachable
-            // rows absent from the live _txn; a WAL native partition carries a real stamp.
+            // no seqTxn (non-WAL/legacy native, or a detached/attachable row absent from the
+            // live _txn) renders null; only a real stamp (> 0) shows a number.
             Long st = seqTxns.get(nameColumn);
-            line = line.replaceAll("SEQTXN", String.valueOf(st != null ? st : -1L));
+            line = line.replaceAll("SEQTXN", st != null && st > 0 ? String.valueOf(st) : "null");
             sink.put(line).put('\n');
         }
         return sink.toString();
