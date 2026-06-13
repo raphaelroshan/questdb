@@ -1459,6 +1459,9 @@ public class TableReader implements Closeable, SymbolTableSource {
                                     parquetPartitions.setQuick(partitionIndex, parquetMem);
                                 }
                             } catch (CairoException e) {
+                                if (!txFile.isPartitionRemote(partitionIndex)) {
+                                    throw e;
+                                }
                                 LOG.error().$("could not open parquet partition [path=").$(path).$(", err=").$safe(e.getFlyweightMessage()).I$();
                                 Misc.free(parquetPartitions.getQuick(partitionIndex));
                                 parquetPartitions.setQuick(partitionIndex, NullMemoryCMR.INSTANCE);
