@@ -161,7 +161,13 @@ fn prepare_column<'a>(
         .codec()
         .map_err(|e| fmt_err!(InvalidType, "invalid codec: {}", e))?
         .into();
-    let num_values = chunk.num_values as i64;
+    let num_values = i64::try_from(chunk.num_values).map_err(|_| {
+        fmt_err!(
+            InvalidType,
+            "num_values {} out of i64 range",
+            chunk.num_values
+        )
+    })?;
 
     let descriptor = reconstruct_descriptor(
         col_desc.physical_type,
