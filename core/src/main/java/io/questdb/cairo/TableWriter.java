@@ -1796,9 +1796,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             }
             txWriter.setPartitionNative(partitionTimestamp, partitionSeqTxn);
             // The old dir's data.parquet is deleted below, so generated must not outlive it.
-            // Also clears REMOTE: the rewrite produced fresh native bytes, so no remote
-            // copy matches anymore and re-upload must not be suppressed by a stale bit.
-            txWriter.setPartitionSeqTxnByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION, partitionSeqTxn);
+            txWriter.setPartitionParquetGenerated(partitionIndex, false);
             txWriter.bumpPartitionTableVersion();
             commitTxWriter();
 

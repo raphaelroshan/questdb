@@ -659,6 +659,9 @@ public class TableSnapshotRestore implements QuietCloseable {
             if (!txWriter.isPartitionParquet(i)) {
                 continue;
             }
+            if (txWriter.isPartitionRemotelyServed(i)) {
+                continue;
+            }
             long partitionTs = txWriter.getPartitionTimestampByIndex(i);
             long nameTxn = txWriter.getPartitionNameTxn(i);
 
