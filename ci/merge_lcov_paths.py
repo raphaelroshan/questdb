@@ -13,8 +13,22 @@ class LcovMerger:
         self.files = {}  # normalized_path -> file data
 
     def normalize_path(self, path):
-        """Remove CI-specific path prefixes (Azure Pipelines agent work dirs)"""
+        """Canonicalize a source path so the same file merges into one entry.
+
+        Every Rust source is instrumented twice: once in libquestdbr.so built by
+        the rust-maven-plugin (line hits come from the Java/JNI test run) and
+        once in the cargo test binaries. The two runs record the file under
+        different absolute prefixes, so keying on the raw path produces two
+        half-covered records that never union. lcov_cobertura.py then relativizes
+        both against 'core/rust' to the same class name, letting the sparser
+        record win -- which is why a file with rich cargo unit-test coverage can
+        still report near-zero. Anchoring on the 'core/rust/' crate root drops
+        any leading prefix so both records share one key and merge by max.
+        """
         path = re.sub(r'.*/(_work|work)/\d+/s/', '', path)
+        match = re.search(r'(?:^|.*/)(core/rust/.+)$', path)
+        if match:
+            return match.group(1)
         return path
 
     def parse_and_merge_lcov(self, filepath):
