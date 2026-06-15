@@ -76,6 +76,14 @@ public class Utf8StringSinkTest {
     }
 
     @Test
+    public void testEscapeJsonStrEscapesNullByte() {
+        final Utf8String src = new Utf8String(new byte[]{'a', 0, 'b'}, true);
+        final Utf8StringSink sink = new Utf8StringSink();
+        sink.escapeJsonStr(src);
+        TestUtils.assertEquals("a\\u0000b", sink.asAsciiCharSequence());
+    }
+
+    @Test
     public void testPutUtf8Sequence() {
         Utf8StringSink sink = new Utf8StringSink(1);
         final String str = "こんにちは世界";
