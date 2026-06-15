@@ -6477,8 +6477,8 @@ public class IODispatcherTest extends AbstractTest {
                     Content-Type: application/json; charset=utf-8\r
                     Keep-Alive: timeout=5, max=10000\r
                     \r
-                    76\r
-                    {"query":"insert into tab value (1)","error":"found [tok='value', len=5] 'select' or 'values' expected","position":16}\r
+                    74\r
+                    {"query":"insert into tab value (1)","error":"unexpected token: value, 'select' or 'values' expected","position":16}\r
                     00\r
                     \r
                     """, 1, 0, false);

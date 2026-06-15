@@ -284,7 +284,7 @@ public class CopyExportTest extends AbstractCairoTest {
                 .fails(56, "invalid compression codec[aa], expected one of: uncompressed, snappy, gzip, brotli, zstd, lz4_raw");
 
         assertQuery("copy test_table to 'test_table'  with format parquet compression_codec uncompressed compression_level aa;")
-                .fails(102, "found [tok='aa', len=2] bad integer");
+                .fails(102, "unexpected token: aa, bad integer");
 
         assertQuery("copy test_table to 'test_table'  with format parquet compression_codec zstd compression_level 120;")
                 .fails(94, "ZSTD compression level must be between 1 and 22");
@@ -540,7 +540,7 @@ public class CopyExportTest extends AbstractCairoTest {
         assertQuery("copy (select x from non_existing_table) to 'tmp' with format parquet")
                 .fails(20, "table does not exist [table=non_existing_table]");
         assertQuery("copy (select a+1 from1 v) to 'tmp' with format parquet")
-                .fails(23, "found [tok='v', len=1] ',', 'from' or 'over' expected");
+                .fails(23, "unexpected token: v, ',', 'from' or 'over' expected");
         assertQuery("copy (select 1) to 'tmp' with format csv")
                 .fails(37, "unsupported format, only 'parquet' is supported");
     }
@@ -914,13 +914,13 @@ public class CopyExportTest extends AbstractCairoTest {
     @Test
     public void testCopyParquetSyntaxErrorInvalidCompressionLevel() throws Exception {
         assertQuery("copy test_table to 'output' with format parquet compression_level 'invalid'")
-                .fails(66, "found [tok=''invalid'', len=9] bad integer");
+                .fails(66, "unexpected token: 'invalid', bad integer");
     }
 
     @Test
     public void testCopyParquetSyntaxErrorInvalidDataPageSize() throws Exception {
         assertQuery("copy test_table to 'output' with format parquet data_page_size 'invalid'")
-                .fails(63, "found [tok=''invalid'', len=9] bad integer");
+                .fails(63, "unexpected token: 'invalid', bad integer");
     }
 
     @Test
@@ -938,13 +938,13 @@ public class CopyExportTest extends AbstractCairoTest {
     @Test
     public void testCopyParquetSyntaxErrorInvalidParquetVersion() throws Exception {
         assertQuery("copy test_table to 'output' with format parquet parquet_version 'invalid'")
-                .fails(64, "found [tok=''invalid'', len=9] bad integer");
+                .fails(64, "unexpected token: 'invalid', bad integer");
     }
 
     @Test
     public void testCopyParquetSyntaxErrorInvalidRowGroupSize() throws Exception {
         assertQuery("copy test_table to 'output' with format parquet row_group_size 'invalid'")
-                .fails(63, "found [tok=''invalid'', len=9] bad integer");
+                .fails(63, "unexpected token: 'invalid', bad integer");
     }
 
     @Test

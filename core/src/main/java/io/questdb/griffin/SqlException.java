@@ -127,11 +127,9 @@ public class SqlException extends Exception implements Sinkable, FlyweightMessag
         return tok == null ?
                 SqlException.$(position, msg)
                 :
-                SqlException.$(position, "found [tok='")
+                SqlException.$(position, "unexpected token: ")
                 .put(tok)
-                .put("', len=")
-                .put(tok.length())
-                .put("] ")
+                .put(", ")
                 .put(msg);
     }
 

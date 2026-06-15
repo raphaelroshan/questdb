@@ -48,7 +48,7 @@ public class SqlExceptionTest extends AbstractCairoTest {
     @Test
     public void testParserErr() {
         TestUtils.assertEquals(
-                "[17] found [tok=')', len=1] expected ',', or 'colName'",
+                "[17] unexpected token: ), expected ',', or 'colName'",
                 SqlException.parserErr(17, ")", "expected ',', or 'colName'").getMessage()
         );
 

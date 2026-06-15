@@ -126,7 +126,7 @@ public class LikeVarcharFunctionFactoryTest extends AbstractCairoTest {
         String query = "SELECT * FROM myTable WHERE name LIKE '%docs\\';";
         assertQuery(query)
                 .ddl(createTable)
-                .fails(5, "found [tok='%docs\\', len=6] LIKE pattern must not end with escape character");
+                .fails(5, "unexpected token: %docs\\, LIKE pattern must not end with escape character");
     }
 
     @Test
@@ -135,7 +135,7 @@ public class LikeVarcharFunctionFactoryTest extends AbstractCairoTest {
         String query = "SELECT * FROM myTable WHERE name LIKE '_%docs\\';";
         assertQuery(query)
                 .ddl(createTable)
-                .fails(6, "found [tok='_%docs\\', len=7] LIKE pattern must not end with escape character");
+                .fails(6, "unexpected token: _%docs\\, LIKE pattern must not end with escape character");
     }
 
     @Test
