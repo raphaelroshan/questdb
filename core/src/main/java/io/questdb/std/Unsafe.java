@@ -336,9 +336,10 @@ public final class Unsafe {
                     .put(", size=")
                     .put(size)
                     .put(", memoryTag=").put(memoryTag)
-                    .put("], original message: ")
-                    .put(oom.getMessage());
-            System.err.println(e.getFlyweightMessage());
+                    .put(']');
+            if (oom.getMessage() != null) {
+                e.put(", original message: ").put(oom.getMessage());
+            }
             throw e;
         }
     }
@@ -424,9 +425,10 @@ public final class Unsafe {
                     .put(", newSize=")
                     .put(newSize)
                     .put(", memoryTag=").put(memoryTag)
-                    .put("], original message: ")
-                    .put(oom.getMessage());
-            System.err.println(e.getFlyweightMessage());
+                    .put(']');
+            if (oom.getMessage() != null) {
+                e.put(", original message: ").put(oom.getMessage());
+            }
             throw e;
         }
     }
